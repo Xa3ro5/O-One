@@ -1,0 +1,1938 @@
+-- Operation One / Smug ESP | 2026-11-06.7
+-- Load the shared SmugLibCoreV2 base and let it complete initialization.
+local function loadSmugLibrary()
+    local url="https://raw.githubusercontent.com/Xa3ro5/LifeIsRoblox/refs/heads/main/SmugLibCoreV2.lua"
+    local freshUrl=url.."?smuglib="..game:GetService("HttpService"):GenerateGUID(false)
+    local ok,source=pcall(game.HttpGet,game,freshUrl,true)
+    assert(ok and type(source)=="string" and source~="","Failed to download SmugLib V2.")
+    local factory,compileError=loadstring(source)
+    assert(factory,compileError or "Failed to compile SmugLib V2.")
+    return factory()
+end
+
+-- Read-only CollectionService registry; GUI and adornments are the only owned instances.
+local function createObjectESP(app,C,win,overlay,highlightFolder,helpers)
+    local CS=game:GetService("CollectionService")
+    local Players=game:GetService("Players")
+    local localPlayer=Players.LocalPlayer
+    local make,text,labelAt,connect=helpers.make,helpers.text,helpers.labelAt,helpers.connect
+    local categoryOrder={"Mines & traps","Cameras","Drones","Explosives","Grenades","Objectives","Barriers"}
+    local categoryTypes={
+        ["Mines & traps"]={"NeedleMine","Claymore","ProximityAlarm","BarbedWire"},
+        ["Cameras"]={"DefaultCamera","DefaultCameraHack","BulletproofCamera","StickyCamera"},
+        ["Drones"]={"Drone"},
+        ["Explosives"]={"RemoteC4","BreachCharge","HardBreachCharge","ThermiteCharge","ToxicCharge","IncendiaryCanister"},
+        ["Grenades"]={"FragGrenade","ImpactGrenade","StunGrenade","SmokeGrenade","EMPGrenade","IncendiaryGrenade","LaunchedGrenade","Thrown","Throwable"},
+        ["Objectives"]={"Bomb","Defuser","Zone","EndMatchZone","SpawnZone"},
+        ["Barriers"]={"DeployableShield","Shield","MetalShield","GlassShield","BarricadeItem","DoorBarricade","MetalBarricade","ReinforceItem","Reinforcement"},
+    }
+    local lookup,types={},{}
+    local categoryColor={
+        ["Mines & traps"]="FF8066",["Cameras"]="6FCBF3",["Drones"]="A5AFFA",["Explosives"]="FF626E",
+        ["Grenades"]="F3AC68",["Objectives"]="F6D575",["Barriers"]="91A8B9",
+    }
+    for _,category in ipairs(categoryOrder) do for _,tag in ipairs(categoryTypes[category]) do lookup[tag]=category;types[tag]=true end end
+    local ruleDefault={enabled=false,color="FFFFFF",labels=true,showDistance=true,showHealth=false,
+        showOwner=false,chams=true,fill=78,outline=5,depth="Through walls",filter="All",scale=12,hideDestroyed=true}
+    local numberRanges={fill={0,100},outline={0,100},scale={10,18}}
+    local function validated(key,value)
+        value=helpers.normalize(value)
+        if ruleDefault[key]==nil then return nil end
+        if type(ruleDefault[key])=="boolean" then if type(value)=="boolean" then return value end
+        elseif numberRanges[key] then
+            if type(value)=="number" and value==value and math.abs(value)~=math.huge then return math.clamp(value,numberRanges[key][1],numberRanges[key][2]) end
+        elseif key=="color" then return type(value)=="string" and value:gsub("#",""):match("^%x%x%x%x%x%x$") or nil
+        elseif key=="depth" then return table.find({"Through walls","Visible only"},value) and value or nil
+        elseif key=="filter" then return table.find({"All","Other owners","Owned","Unowned"},value) and value or nil end
+        return nil
+    end
+    local raw=type(C.objectRules)=="table" and C.objectRules or {}
+    local rules={};C.objectRules=rules
+    local function loadRule(id,category,inherit)
+        local r=inherit and setmetatable({},{__index=inherit}) or table.clone(ruleDefault)
+        if not inherit then r.color=categoryColor[category] end
+        if type(raw[id])=="table" then
+            for key,value in pairs(raw[id]) do local v=validated(key,value);if v~=nil then r[key]=v end end
+        end
+        rules[id]=r;return r
+    end
+    for _,category in ipairs(categoryOrder) do loadRule("@"..category,category) end
+    for tag in pairs(types) do if raw[tag] then loadRule(tag,lookup[tag],rules["@"..lookup[tag]]) end end
+    local registry,visuals,counts={}, {}, {}
+    local candidates={};local cacheClock=1;local tagClock=0
+    local object={registry=registry,visuals=visuals,counts=counts,rules=rules,categoryOrder=categoryOrder,types=types}
+    app.objectESP=object
+    local function ruleFor(tag) return rules[tag] or rules["@"..lookup[tag]] end
+    local function isWorld(instance)
+        if not instance:IsDescendantOf(workspace) then return false end
+        local viewmodels=workspace:FindFirstChild("Viewmodels")
+        if viewmodels and instance:IsDescendantOf(viewmodels) then return false end
+        local cubicle=workspace:FindFirstChild("LoadoutCubicle")
+        if cubicle and instance:IsDescendantOf(cubicle) then return false end
+        local camera=workspace.CurrentCamera
+        if camera and instance:IsDescendantOf(camera) then return false end
+        if instance:FindFirstChildOfClass("Humanoid") then return false end
+        for _,player in ipairs(Players:GetPlayers()) do
+            if player.Character and instance:IsDescendantOf(player.Character) then return false end
+        end
+        return instance:IsA("Model") or instance:IsA("BasePart")
+    end
+    local function priority(tag)
+        if tag=="Throwable" or tag=="Thrown" then return 1 end
+        return 3
+    end
+    local function register(instance,tag)
+        if not isWorld(instance) then return end
+        local e=registry[instance]
+        if not e or priority(tag)>priority(e.tag) then registry[instance]={instance=instance,tag=tag} end
+    end
+    local function refresh(full)
+        if full then for tag in pairs(types) do for _,instance in ipairs(CS:GetTagged(tag)) do register(instance,tag) end end end
+        table.clear(counts)
+        for instance,e in pairs(registry) do
+            if not instance:IsDescendantOf(workspace) or not CS:HasTag(instance,e.tag) then
+                registry[instance]=nil
+            else counts[e.tag]=(counts[e.tag] or 0)+1 end
+        end
+        for instance,v in pairs(visuals) do
+            if not registry[instance] then v.label:Destroy();if v.highlight then v.highlight:Destroy() end;visuals[instance]=nil end
+        end
+    end
+    function object:Refresh() refresh(true);cacheClock=1 end
+    local function ownerOf(instance)
+        local owner=instance:GetAttribute("Owner") or instance:GetAttribute("UserId")
+        if owner==nil then
+            local state=instance:FindFirstChild("StateObject")
+            local value=state and state:FindFirstChild("owner")
+            if value and value:IsA("ObjectValue") and value.Value and value.Value:IsA("Player") then return value.Value.UserId,value.Value.Name end
+        end
+        if type(owner)=="number" then
+            local p=Players:GetPlayerByUserId(owner);return owner,p and p.Name or tostring(owner)
+        elseif type(owner)=="string" then return tonumber(owner),owner end
+        return nil,nil
+    end
+    local function positionOf(instance)
+        if instance:IsA("BasePart") then return instance.Position end
+        local part=instance.PrimaryPart or instance:FindFirstChild("Root") or instance:FindFirstChildWhichIsA("BasePart",true)
+        return part and part.Position or nil
+    end
+    local function hideAll(destroy)
+        for _,v in pairs(visuals) do
+            v.label.Visible=false;v.activeChams=false
+            if v.highlight then
+                if destroy then v.highlight:Destroy();v.highlight=nil else v.highlight.Enabled=false end
+            end
+        end
+    end
+    function object:Hide() hideAll(true) end
+    function object:ChamsDemand()
+        local count=0
+        for i=1,math.min(#candidates,C.objectLimit) do if candidates[i].rule.chams and candidates[i].rule.enabled then count+=1 end end
+        return count
+    end
+    local function select(camera)
+        table.clear(candidates)
+        for instance,e in pairs(registry) do
+            local r=ruleFor(e.tag)
+            if r.enabled and isWorld(instance) then
+                -- A more specific tagged parent already covers its own component parts.
+                local parent=registry[instance.Parent]
+                if not parent or not ruleFor(parent.tag).enabled then
+                    local health=instance:GetAttribute("Health")
+                    local ownerId,ownerName=ownerOf(instance)
+                    local allowed=not (r.hideDestroyed and type(health)=="number" and health<=0)
+                    if r.filter=="Other owners" and (ownerId==nil or ownerId==localPlayer.UserId) then allowed=false end
+                    if r.filter=="Owned" and ownerId~=localPlayer.UserId then allowed=false end
+                    if r.filter=="Unowned" and ownerId~=nil then allowed=false end
+                    local pos=allowed and positionOf(instance)
+                    if pos then
+                        local distance=(pos-camera.CFrame.Position).Magnitude
+                        table.insert(candidates,{e=e,rule=r,distance=distance,health=health,owner=ownerName,color=Color3.fromHex(r.color)})
+                    end
+                end
+            end
+        end
+        table.sort(candidates,function(a,b)return a.distance<b.distance end)
+    end
+    function object:Render(camera,dt,budget)
+        cacheClock+=dt;tagClock+=dt
+        if tagClock>=2 then tagClock=0;refresh(false) end
+        if cacheClock>=0.2 then cacheClock=0;select(camera) end
+        hideAll()
+        local count,used=0,0
+        local occupied={}
+        for i=1,math.min(#candidates,C.objectLimit) do
+            local q=candidates[i];local e,r=q.e,q.rule;local instance=e.instance
+            if instance:IsDescendantOf(workspace) and r.enabled then
+                local pos=positionOf(instance)
+                local distance=pos and (pos-camera.CFrame.Position).Magnitude or math.huge
+                if pos then
+                    local projected,onScreen=camera:WorldToViewportPoint(pos)
+                    local v=visuals[instance]
+                    if not v then
+                        v={label=text(overlay,r.scale),lastUsed=os.clock()};visuals[instance]=v
+                    end
+                    v.lastUsed=os.clock()
+                    local color=q.color
+                    if onScreen and r.labels then
+                        local cell=math.floor(projected.X/150)..":"..math.floor(projected.Y/28)
+                        local lane=occupied[cell] or 0;occupied[cell]=lane+1
+                        local pieces={e.tag}
+                        if r.showDistance then table.insert(pieces,string.format("%.0f studs",distance)) end
+                        if r.showHealth and type(q.health)=="number" then table.insert(pieces,string.format("HP %.0f",q.health)) end
+                        if r.showOwner and q.owner then table.insert(pieces,"@"..q.owner) end
+                        local vp=camera.ViewportSize
+                        local px=math.clamp(projected.X,100,math.max(100,vp.X-100))
+                        local py=math.clamp(projected.Y+(C.objectDeclutter and lane*(r.scale+4) or 0),14,math.max(14,vp.Y-16))
+                        labelAt(v.label,table.concat(pieces," · "),px,py,color,C.opacity/100,300)
+                        if C.objectDeclutter and lane>3 then v.label.Visible=false end
+                        v.label.TextSize=r.scale
+                    end
+                    if r.chams and used<budget then
+                        if not v.highlight then v.highlight=make("Highlight",{Name="Object_"..e.tag,Enabled=false},highlightFolder) end
+                        local h=v.highlight;h.Adornee=instance;h.FillColor=color;h.OutlineColor=color
+                        h.FillTransparency=r.fill/100;h.OutlineTransparency=r.outline/100
+                        h.DepthMode=r.depth=="Visible only" and Enum.HighlightDepthMode.Occluded or Enum.HighlightDepthMode.AlwaysOnTop
+                        h.Enabled=true;v.activeChams=true;used+=1
+                    elseif v.highlight then v.highlight:Destroy();v.highlight=nil end
+                    count+=1
+                end
+            end
+        end
+        for instance,v in pairs(visuals) do
+            if v.highlight and not v.activeChams then v.highlight:Destroy();v.highlight=nil end
+            if os.clock()-v.lastUsed>2 then v.label:Destroy();if v.highlight then v.highlight:Destroy() end;visuals[instance]=nil end
+        end
+        app.stats.objects=count;app.stats.objectCandidates=#candidates;app.stats.objectChams=used
+    end
+    local controls={}
+    app.objectCategoryControls={}
+    -- Old per-type switches must not contradict the new category switches.
+    for tag in pairs(types) do
+        if rules[tag] then
+            for _,key in ipairs({"enabled","chams","labels","showDistance","showHealth","showOwner","hideDestroyed","filter","depth","fill","outline"}) do rules[tag][key]=nil end
+        end
+    end
+    for _,category in ipairs(categoryOrder) do rules["@"..category].filter="All" end
+    local function sync()
+        for _,binding in ipairs(controls) do binding.control:Set(binding.get()) end
+    end
+    function app:SetObjectRule(id,key,value)
+        id=helpers.normalize(id)
+        local category=lookup[id] or (id:sub(1,1)=="@" and table.find(categoryOrder,id:sub(2)) and id:sub(2))
+        local v=validated(key,value)
+        if not category or v==nil then return false end
+        if not rules[id] then rules[id]=setmetatable({},{__index=rules["@"..category]}) end
+        rules[id][key]=v
+        if id:sub(1,1)=="@" then
+            for _,tag in ipairs(categoryTypes[category]) do if rules[tag] then rules[tag][key]=nil end end
+        end
+        cacheClock=1;sync();return true
+    end
+    function app:ObjectSnapshot()
+        return {counts=table.clone(counts),shown=self.stats.objects or 0,candidates=self.stats.objectCandidates or 0,chams=self.stats.objectChams or 0}
+    end
+    function object:Reset()
+        for _,category in ipairs(categoryOrder) do
+            local r=table.clone(ruleDefault);r.color=categoryColor[category];rules["@"..category]=r
+            for _,tag in ipairs(categoryTypes[category]) do rules[tag]=nil end
+        end
+        cacheClock=1;hideAll(true);sync()
+    end
+    local function categoryToggle(section,category,key,title)
+        local function get()return rules["@"..category][key]end
+        local control=section:Toggle(title,function(on)app:SetObjectRule("@"..category,key,on)end,get())
+        table.insert(controls,{control=control,get=get})
+        app.objectCategoryControls[category]=app.objectCategoryControls[category] or {}
+        app.objectCategoryControls[category][key]=control
+    end
+    local function globalToggle(section,title,key,onValue,offValue)
+        if onValue==nil then onValue=true;offValue=false end
+        local function get()
+            for _,category in ipairs(categoryOrder) do if rules["@"..category][key]~=onValue then return false end end
+            return true
+        end
+        local control=section:Toggle(title,function(on)
+            local value=offValue;if on then value=onValue end
+            for _,category in ipairs(categoryOrder) do app:SetObjectRule("@"..category,key,value) end
+        end,get())
+        table.insert(controls,{control=control,get=get})
+    end
+    local tab=win:Folder("Objects")
+    local selection=tab:Section("WHAT TO SHOW")
+    selection:Label("Enable the categories you need. Range is unlimited.")
+    for _,category in ipairs(categoryOrder) do categoryToggle(selection,category,"enabled",category) end
+    local chams=tab:Section("CHAMS BY CATEGORY")
+    for _,category in ipairs(categoryOrder) do categoryToggle(chams,category,"chams",category) end
+    local visual=tab:Section("OBJECT APPEARANCE")
+    globalToggle(visual,"Chams through walls","depth","Through walls","Visible only")
+    globalToggle(visual,"Filled chams","fill",78,100)
+    globalToggle(visual,"Chams outlines","outline",5,100)
+    local labels=tab:Section("OBJECT LABELS")
+    globalToggle(labels,"Names","labels")
+    globalToggle(labels,"Distance","showDistance")
+    globalToggle(labels,"Object health","showHealth")
+    globalToggle(labels,"Owner","showOwner")
+    globalToggle(labels,"Hide destroyed objects","hideDestroyed")
+    for tag in pairs(types) do
+        connect(CS:GetInstanceAddedSignal(tag),function(instance)register(instance,tag);cacheClock=1 end)
+        connect(CS:GetInstanceRemovedSignal(tag),function(instance)
+            local e=registry[instance];if e and e.tag==tag then registry[instance]=nil end;cacheClock=1
+        end)
+    end
+    connect(workspace.DescendantAdded,function(instance)
+        if instance:IsA("Model") or instance:IsA("BasePart") then
+            for _,tag in ipairs(CS:GetTags(instance)) do if types[tag] then register(instance,tag) end end
+        end
+    end)
+    refresh(true)
+    return object
+end
+
+local SILENT_AIM_ACTOR_SOURCE=[========[-- Operation One adapter: redirect only the native local Gun:send_shoot look.
+-- Spread, range, ray_damage, ammunition and the native shoot event remain native.
+local function createSilentAim(app,win,overlay,helpers)
+    local Players=game:GetService("Players")
+    local UIS=game:GetService("UserInputService")
+    local localPlayer=Players.LocalPlayer
+    local make=helpers.make
+    local settings={fov=150,range=1000,chance=100,hitbox="Head",priority="Crosshair",
+        visibleOnly=true,ignoreFriends=false,ignoreProtected=true,sticky=true,
+        holdRMB=false,adsOnly=false,showFov=true,showTarget=true}
+    local aim={enabled=false,ready=false,settings=settings,target=nil,error=nil,
+        stats={shots=0,redirected=0,missedChance=0,candidates=0},generation=0}
+    app.silentAim=aim
+    local module,originalSend,originalLook,wrappedSend,wrappedLook
+    local bridge
+    local scopes=setmetatable({},{__mode="k"})
+    local params=RaycastParams.new()
+    params.FilterType=Enum.RaycastFilterType.Exclude
+    params.IgnoreWater=true
+    local ring=make("Frame",{Name="SilentAimFOV",AnchorPoint=Vector2.new(0.5,0.5),
+        BackgroundTransparency=1,Visible=false,ZIndex=8},overlay)
+    make("UICorner",{CornerRadius=UDim.new(1,0)},ring)
+    local stroke=make("UIStroke",{Color=Color3.fromRGB(101,229,181),Thickness=1,Transparency=0.3},ring)
+    local marker=make("Frame",{Name="SilentAimTarget",AnchorPoint=Vector2.new(0.5,0.5),
+        Size=UDim2.fromOffset(8,8),BackgroundTransparency=1,Visible=false,ZIndex=9},overlay)
+    make("UICorner",{CornerRadius=UDim.new(1,0)},marker)
+    make("UIStroke",{Color=Color3.fromRGB(255,204,110),Thickness=1.5},marker)
+    local function aliveCharacter(char,player)
+        if not char or not char:IsDescendantOf(workspace) then return false end
+        local state=char:FindFirstChild("StateObject")
+        local owner=state and state:FindFirstChild("owner")
+        local clean=state and state:FindFirstChild("clean")
+        local hum=char:FindFirstChildOfClass("Humanoid")
+        return owner and owner:IsA("ObjectValue") and owner.Value==player
+            and clean and clean:IsA("BoolValue") and not clean.Value
+            and hum and hum.Health>0
+    end
+    local function ownsWeapon(weapon)
+        if type(weapon)~="table" then return false end
+        local owner=weapon.owner
+        return type(owner)=="table" and type(owner.values)=="table"
+            and owner.values.equipped==weapon and aliveCharacter(owner.instance,localPlayer)
+    end
+    local function activeInput()
+        return app.alive and aim.enabled and aim.ready and (not helpers.allowed or helpers.allowed())
+            and not UIS:GetFocusedTextBox()
+            and (not settings.holdRMB or UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton2))
+    end
+    local function visible(origin,position,entry,localChar,camera)
+        local ignore={camera}
+        if localChar then table.insert(ignore,localChar) end
+        local folder=workspace:FindFirstChild("Viewmodels")
+        local root=localChar and localChar:FindFirstChild("HumanoidRootPart")
+        if folder and root then
+            for _,rig in ipairs(folder:GetChildren()) do
+                local torso=rig:FindFirstChild("torso")
+                local motor=torso and torso:FindFirstChild("JointMotor")
+                if motor and motor:IsA("Motor6D") and motor.Part0==root then table.insert(ignore,rig) end
+            end
+        end
+        params.FilterDescendantsInstances=ignore
+        local delta=position-origin
+        if delta.Magnitude<0.001 then return false end
+        local hit=workspace:Raycast(origin,delta,params)
+        return hit==nil or hit.Instance:IsDescendantOf(entry.char)
+            or (entry.rig and hit.Instance:IsDescendantOf(entry.rig))
+    end
+    local function eligible(entry)
+        if entry.player==localPlayer or entry.player.Parent~=Players or helpers.ally(entry.player)
+            or not aliveCharacter(entry.char,entry.player) then return false end
+        if settings.ignoreFriends and (entry.friend or entry.friendKnown==false) then return false end
+        if settings.ignoreProtected and entry.char:FindFirstChildOfClass("ForceField") then return false end
+        -- A cached visual rig must still belong to the current live root.
+        if not entry.root or not entry.root:IsDescendantOf(entry.char) then return false end
+        if entry.rig~=entry.char then
+            local torso=entry.rig and entry.rig:FindFirstChild("torso")
+            local motor=torso and torso:FindFirstChild("JointMotor")
+            if not motor or not motor:IsA("Motor6D") or motor.Part0~=entry.root or motor.Part1~=torso then return false end
+        end
+        return true
+    end
+    local function selectTarget(origin,localChar,maxRange)
+        local camera=workspace.CurrentCamera
+        if not camera then return nil end
+        local center=camera.ViewportSize*0.5
+        local candidates={}
+        for _,entry in pairs(app.entries) do
+            if eligible(entry) then
+                local head=entry.parts.head or entry.parts.Head
+                local torso=entry.parts.torso or entry.parts.UpperTorso or entry.parts.Torso
+                local parts={}
+                if settings.hitbox~="Torso" and head then table.insert(parts,head) end
+                if settings.hitbox~="Head" and torso then table.insert(parts,torso) end
+                for _,part in ipairs(parts) do
+                    if part.Parent and part:IsDescendantOf(workspace) then
+                        local position=part.Position
+                        local projected,onScreen=camera:WorldToViewportPoint(position)
+                        local pixel=(Vector2.new(projected.X,projected.Y)-center).Magnitude
+                        local distance=(position-origin).Magnitude
+                        if onScreen and projected.Z>0 and pixel<=settings.fov and distance>0.01
+                            and distance<=math.min(settings.range,maxRange or 1000) then
+                            local score=pixel/math.max(1,settings.fov)
+                            if settings.priority=="Distance" then score=distance/1000
+                            elseif settings.priority=="Health" then score=entry.hum.Health/math.max(1,entry.hum.MaxHealth)+score*0.001 end
+                            if settings.sticky and aim.target and aim.target.entry.player==entry.player then score*=0.8 end
+                            table.insert(candidates,{entry=entry,part=part,position=position,score=score,
+                                pixel=pixel,distance=distance,screen=Vector2.new(projected.X,projected.Y)})
+                        end
+                    end
+                end
+            end
+        end
+        table.sort(candidates,function(a,b)
+            if a.score==b.score then return a.entry.player.UserId<b.entry.player.UserId end
+            return a.score<b.score
+        end)
+        aim.stats.candidates=#candidates
+        for _,candidate in ipairs(candidates) do
+            if not settings.visibleOnly or visible(origin,candidate.position,candidate.entry,localChar,camera) then
+                return candidate
+            end
+        end
+        return nil
+    end
+    local function detach()
+        -- Respect another script that replaced one of our methods after installation.
+        if module then
+            if module.send_shoot==wrappedSend then module.send_shoot=originalSend end
+            if module.get_shoot_look==wrappedLook then module.get_shoot_look=originalLook end
+        end
+        table.clear(scopes)
+        aim.ready=false
+    end
+    local function stopBridge()
+        local state=bridge
+        bridge=nil
+        if not state then return end
+        state.gate.Value=false;state.gate:Destroy()
+        state.event:Fire("stop")
+        -- Let the Actor consume the stop packet before releasing the channel.
+        task.delay(3,function()
+            state.connection:Disconnect()
+            state.event:Destroy()
+        end)
+    end
+    local function startBridge(generation)
+        assert(type(run_on_actor)=="function" and type(create_comm_channel)=="function",
+            "This runtime needs run_on_actor and create_comm_channel for Operation One.")
+        local scripts=localPlayer:FindFirstChild("PlayerScripts")
+        local actor=scripts and scripts:FindFirstChild("Folder")
+        assert(actor and actor:IsA("Actor") and actor:FindFirstChild("Loader"),"Operation One's gameplay Actor is unavailable.")
+        local id,event=create_comm_channel()
+        local gate=Instance.new("BoolValue")
+        gate.Name="SilentAimEnabled";gate.Value=false;gate.Parent=overlay
+        local state={event=event,gate=gate,lastMessage=os.clock(),heartbeat=0,revision=1}
+        bridge=state
+        state.connection=event.Event:Connect(function(kind,data,revision)
+            if bridge~=state or generation~=aim.generation or not app.alive then return end
+            if kind=="booted" then
+                event:Fire("settings",table.clone(settings),state.revision)
+            elseif kind=="ready" or kind=="snapshot" then
+                state.lastMessage=os.clock()
+                aim.stats=data.stats;aim.error=data.error;aim.ready=data.ready;aim.nativeWeapons=data.nativeWeapons
+                state.target=data
+                if data.error then aim:Enable(false);return end
+                if kind=="ready" and revision==state.revision then gate.Value=aim.enabled and data.ready end
+            elseif kind=="error" then
+                aim.error=tostring(data);aim:Enable(false)
+                if app.window then app.window:Notify(aim.error,4) end
+            end
+        end)
+        aim.adapter="Actor";aim.enabled=true
+        run_on_actor(actor,helpers.actorSource,id,gate)
+    end
+    local function attach()
+        assert(game.PlaceId==72920620366355,"Silent Aim supports Operation One only.")
+        local modules=game:GetService("ReplicatedStorage"):FindFirstChild("Modules")
+        local items=modules and modules:FindFirstChild("Items")
+        local item=items and items:FindFirstChild("Item")
+        local gun=item and item:FindFirstChild("Gun")
+        assert(gun and gun:IsA("ModuleScript"),"Native Gun module is unavailable.")
+        local loaded=helpers.resolveGun and helpers.resolveGun(gun) or require(gun)
+        assert(type(loaded)=="table" and type(loaded.send_shoot)=="function"
+            and type(loaded.get_shoot_look)=="function","Native Gun contract is unavailable.")
+        return loaded
+    end
+    function aim:Enable(on)
+        if on~=true then
+            self.enabled=false;self.generation+=1;self.target=nil
+            stopBridge();detach();ring.Visible=false;marker.Visible=false
+            if self.control then self.control:Set(false,false) end
+            return true
+        end
+        if not app.alive then return false end
+        if self.enabled and (self.ready or bridge) then return true end
+        self.generation+=1
+        local generation=self.generation
+        if helpers.actorSource and not helpers.nativeActor then
+            self.error=nil
+            local ok,err=pcall(startBridge,generation)
+            if not ok then self.error=tostring(err);self:Enable(false) end
+            if self.control then self.control:Set(self.enabled,false) end
+            return ok and self.enabled
+        end
+        local ok,loaded=pcall(attach)
+        if generation~=self.generation or not app.alive then return false end
+        if not ok then
+            self.error=tostring(loaded)
+            self:Enable(false)
+            if app.window then app.window:Notify(self.error,4) end
+            return false
+        end
+        module=loaded;originalSend=module.send_shoot;originalLook=module.get_shoot_look
+        local nativeSend,nativeLook=originalSend,originalLook
+        wrappedLook=function(weapon,...)
+            local base=nativeLook(weapon,...)
+            local scope=scopes[coroutine.running()]
+            if generation~=self.generation or not scope or scope.weapon~=weapon or not activeInput()
+                or not ownsWeapon(weapon) then return base end
+            if scope.decided then return scope.look or base end
+            scope.decided=true
+            local success,result=pcall(function()
+                if typeof(base)~="CFrame" then return nil end
+                if settings.adsOnly and (not weapon.states.sights or not weapon.states.sights:get()) then return nil end
+                if math.random()*100>=settings.chance then self.stats.missedChance+=1;return nil end
+                local pellets=weapon.states.pellets:get()
+                local target=selectTarget(base.Position,weapon.owner.instance,pellets>1 and 250 or 1000)
+                self.target=target
+                if not target then return nil end
+                self.stats.redirected+=1
+                -- Preserve muzzle position and let the native shot code apply its own spread/hit tests.
+                return CFrame.lookAt(base.Position,target.position,base.UpVector)
+            end)
+            if not success then
+                self.error=tostring(result);self:Enable(false)
+                return base
+            end
+            scope.look=result
+            return result or base
+        end
+        wrappedSend=function(weapon,...)
+            if generation~=self.generation or not self.enabled or not app.alive or not ownsWeapon(weapon) then return nativeSend(weapon,...) end
+            local thread=coroutine.running()
+            if scopes[thread] then return nativeSend(weapon,...) end
+            scopes[thread]={weapon=weapon,decided=false}
+            self.stats.shots+=1
+            local result=table.pack(pcall(nativeSend,weapon,...))
+            scopes[thread]=nil
+            if not result[1] then error(result[2],0) end
+            return table.unpack(result,2,result.n)
+        end
+        local installed,installError=pcall(function()
+            module.get_shoot_look=wrappedLook
+            module.send_shoot=wrappedSend
+        end)
+        if not installed then
+            self.error=tostring(installError);self:Enable(false);return false
+        end
+        self.error=nil;self.enabled=true;self.ready=true
+        self.adapter="Direct"
+        if self.control then self.control:Set(true,false) end
+        return true
+    end
+    function aim:Set(key,value)
+        if not app.alive or settings[key]==nil then return false end
+        if key=="fov" or key=="range" or key=="chance" then
+            if type(value)~="number" or value~=value or math.abs(value)==math.huge then return false end
+            local bounds={fov={30,600},range={10,1000},chance={0,100}}
+            value=math.clamp(value,bounds[key][1],bounds[key][2])
+        elseif key=="hitbox" then
+            if not table.find({"Head","Torso","Closest part"},value) then return false end
+        elseif key=="priority" then
+            if not table.find({"Crosshair","Distance","Health"},value) then return false end
+        elseif type(value)~="boolean" then return false end
+        settings[key]=value;self.target=nil
+        if bridge then
+            bridge.gate.Value=false
+            bridge.revision+=1
+            bridge.event:Fire("settings",table.clone(settings),bridge.revision)
+        end
+        local control=self.controls and self.controls[key]
+        if control then control:Set(value,false) end
+        return true
+    end
+    function aim:Snapshot()
+        return {enabled=self.enabled,ready=self.ready,error=self.error,
+            adapter=self.adapter,nativeWeapons=self.nativeWeapons,
+            target=self.target and self.target.entry.player.Name or nil,
+            targetUserId=self.target and self.target.entry.player.UserId or nil,
+            hitbox=self.target and self.target.part.Name or nil,stats=table.clone(self.stats),
+            settings=table.clone(settings)}
+    end
+    local clock,statusClock=0,0
+    function aim:Update(dt)
+        if not app.alive then return end
+        clock+=dt;statusClock+=dt
+        if bridge then
+            bridge.heartbeat+=dt
+            if bridge.heartbeat>=0.5 then bridge.heartbeat=0;bridge.event:Fire("heartbeat") end
+            if os.clock()-bridge.lastMessage>4 then
+                self.error="Gameplay Actor stopped responding. Toggle Silent Aim to reconnect."
+                self:Enable(false)
+            end
+        end
+        if self.enabled and not bridge and (module.send_shoot~=wrappedSend or module.get_shoot_look~=wrappedLook) then
+            self.error="Native weapon methods changed; toggle Silent Aim to reconnect."
+            self:Enable(false)
+        end
+        local camera=workspace.CurrentCamera
+        local active=camera and activeInput() and aliveCharacter(app.localCharacter,localPlayer)
+        ring.Visible=active and settings.showFov or false
+        marker.Visible=false
+        if active then
+            ring.Position=UDim2.fromOffset(camera.ViewportSize.X*0.5,camera.ViewportSize.Y*0.5)
+            ring.Size=UDim2.fromOffset(settings.fov*2,settings.fov*2)
+            if clock>=1/30 then
+                clock=0
+                if bridge then
+                    local state=bridge.target
+                    local selected
+                    if state and state.targetUserId then
+                        for player,entry in pairs(app.entries) do
+                            if player.UserId==state.targetUserId then
+                                local part=entry.parts[state.hitbox]
+                                if part then selected={entry=entry,part=part} end
+                                break
+                            end
+                        end
+                    end
+                    self.target=selected
+                else self.target=selectTarget(camera.CFrame.Position,app.localCharacter,1000) end
+            end
+            if self.target and eligible(self.target.entry) and self.target.part.Parent then
+                local p,onScreen=camera:WorldToViewportPoint(self.target.part.Position)
+                marker.Visible=settings.showTarget and onScreen
+                marker.Position=UDim2.fromOffset(p.X,p.Y)
+            end
+        else self.target=nil end
+        stroke.Transparency=self.target and 0.05 or 0.4
+        if statusClock>=0.25 and self.status then
+            statusClock=0
+            local state=not self.enabled and "Disabled" or not active and "Waiting for a live character / aim input" or "Searching inside FOV"
+            if self.target then state="Target: @"..self.target.entry.player.Name.." · "..self.target.part.Name end
+            self.status:SetText(self.error or string.format("%s\n%d shots · %d redirected looks",state,self.stats.shots,self.stats.redirected))
+        end
+    end
+    function aim:Unload()
+        self:Enable(false)
+        ring:Destroy();marker:Destroy()
+    end
+    local tab=win:Folder("Silent Aim")
+    local main=tab:Section("SILENT AIM")
+    aim.control=main:Toggle("Enable Silent Aim",function(on)aim:Enable(on)end,false)
+    main:Label("Native gun shots only · camera stays under your control.")
+    aim.status=main:Label("Disabled")
+    aim.controls={}
+    local function toggle(section,key,title)
+        aim.controls[key]=section:Toggle(title,function(v)aim:Set(key,v)end,settings[key])
+    end
+    toggle(main,"holdRMB","Only while holding right mouse")
+    toggle(main,"adsOnly","Only while aiming down sights")
+    local target=tab:Section("TARGET SELECTION")
+    aim.controls.hitbox=target:Dropdown("Hitbox",{"Head","Torso","Closest part"},function(v)aim:Set("hitbox",v)end,settings.hitbox)
+    aim.controls.priority=target:Dropdown("Priority",{"Crosshair","Distance","Health"},function(v)aim:Set("priority",v)end,settings.priority)
+    aim.controls.fov=target:Slider("FOV radius (pixels)",30,600,settings.fov,function(v)aim:Set("fov",v)end,5)
+    aim.controls.range=target:Slider("Maximum range (studs)",10,1000,settings.range,function(v)aim:Set("range",v)end,10)
+    aim.controls.chance=target:Slider("Redirect chance (%)",0,100,settings.chance,function(v)aim:Set("chance",v)end,1)
+    toggle(target,"sticky","Prefer the current target")
+    local filters=tab:Section("FILTERS & DISPLAY")
+    filters:Label("Teammates and dead/stale characters are always excluded.")
+    toggle(filters,"visibleOnly","Require a clear line of sight")
+    toggle(filters,"ignoreProtected","Ignore ForceField-protected players")
+    toggle(filters,"ignoreFriends","Ignore friends")
+    toggle(filters,"showFov","Show FOV circle")
+    toggle(filters,"showTarget","Show target marker")
+    return aim
+end
+
+-- Runs beside the game's Loader in its existing Actor VM; no extra UI/library.
+local channelId,gate=...
+local channel=get_comm_channel(channelId)
+local stopped=false
+local connections={}
+local controller
+local function stop()
+    if stopped then return end
+    stopped=true
+    if controller then controller:Unload() end
+    for _,connection in ipairs(connections) do connection:Disconnect() end
+    table.clear(connections)
+end
+local function fail(err)
+    channel:Fire("error",tostring(err))
+    stop()
+end
+local success,startError=xpcall(function()
+    local Players=game:GetService("Players")
+    local localPlayer=Players.LocalPlayer
+    local app={alive=true,entries={}}
+    local friends={}
+    local function team(player)
+        return player:GetAttribute("Team") or (not player.Neutral and player.Team and player.Team.Name) or nil
+    end
+    local function ally(player)
+        local a,b=team(localPlayer),team(player)
+        return a~=nil and b~=nil and a==b
+    end
+    local elements={}
+    function elements:Label()return {SetText=function()end}end
+    function elements:Toggle()return {Set=function()end}end
+    elements.Dropdown=elements.Toggle
+    elements.Slider=elements.Toggle
+    local window={Folder=function()return {Section=function()return elements end}end}
+    local function make(_,props)
+        local object=table.clone(props or {})
+        object.Destroy=function()end
+        return object
+    end
+    local function resolveGun(script)
+        local gun=require(script)
+        -- Verify that this VM's live item objects inherit this exact class.
+        local matches=0
+        for _,object in ipairs(getgc(true)) do
+            if type(object)=="table" and typeof(rawget(object,"instance"))=="Instance"
+                and type(rawget(object,"owner"))=="table"
+                and object.send_shoot==gun.send_shoot and object.get_shoot_look==gun.get_shoot_look then
+                matches+=1
+            end
+        end
+        controller.nativeWeapons=matches
+        return gun
+    end
+    controller=createSilentAim(app,window,{}, {make=make,ally=ally,nativeActor=true,resolveGun=resolveGun,
+        allowed=function()return not stopped and gate.Parent~=nil and gate.Value end})
+    local function refresh()
+        local rigs,owned={},{}
+        local folder=workspace:FindFirstChild("Viewmodels")
+        if folder then
+            for _,rig in ipairs(folder:GetChildren()) do
+                local torso=rig:FindFirstChild("torso")
+                local motor=torso and torso:FindFirstChild("JointMotor")
+                if motor and motor:IsA("Motor6D") and motor.Part1==torso and motor.Part0 then rigs[motor.Part0]=rig end
+            end
+        end
+        for _,model in ipairs(workspace:GetChildren()) do
+            if model:IsA("Model") then
+                local state=model:FindFirstChild("StateObject")
+                local owner=state and state:FindFirstChild("owner")
+                local clean=state and state:FindFirstChild("clean")
+                local player=owner and owner:IsA("ObjectValue") and owner.Value
+                local root=model:FindFirstChild("HumanoidRootPart")
+                local hum=model:FindFirstChildOfClass("Humanoid")
+                if player and player:IsA("Player") and player.Parent==Players and root and hum and hum.Health>0
+                    and clean and clean:IsA("BoolValue") and not clean.Value then
+                    if not owned[player] or model==player.Character or rigs[root] then owned[player]=model end
+                end
+            end
+        end
+        app.localCharacter=owned[localPlayer]
+        table.clear(app.entries)
+        for player,char in pairs(owned) do
+            if player~=localPlayer then
+                local root=char.HumanoidRootPart
+                local rig=rigs[root] or char
+                local parts={}
+                for _,part in ipairs(rig:GetChildren()) do
+                    if part:IsA("BasePart") and (part.Name=="head" or part.Name=="torso" or part.Name=="Head"
+                        or part.Name=="Torso" or part.Name=="UpperTorso") then parts[part.Name]=part end
+                end
+                app.entries[player]={player=player,char=char,root=root,rig=rig,
+                    hum=char:FindFirstChildOfClass("Humanoid"),parts=parts,friend=friends[player]==true,
+                    friendKnown=type(friends[player])=="boolean"}
+                if friends[player]==nil then
+                    friends[player]="pending"
+                    task.spawn(function()
+                        local ok,isFriend=pcall(localPlayer.IsFriendsWith,localPlayer,player.UserId)
+                        if not stopped then friends[player]=ok and isFriend or false end
+                    end)
+                end
+            end
+        end
+        for player in pairs(friends) do if player.Parent~=Players then friends[player]=nil end end
+    end
+    local lastHeartbeat=os.clock()
+    table.insert(connections,channel.Event:Connect(function(kind,data,revision)
+        if stopped then return end
+        local ok,err=pcall(function()
+            if kind=="stop" then stop()
+            elseif kind=="heartbeat" then lastHeartbeat=os.clock()
+            elseif kind=="settings" then
+                lastHeartbeat=os.clock()
+                for key,value in pairs(data) do
+                    if controller.settings[key]~=value then assert(controller:Set(key,value),"Invalid aim setting: "..tostring(key)) end
+                end
+                assert(controller:Enable(true),controller.error or "Could not attach native gun methods.")
+                channel:Fire("ready",controller:Snapshot(),revision)
+            end
+        end)
+        if not ok then fail(err) end
+    end))
+    local refreshClock,statusClock=1,0
+    table.insert(connections,game:GetService("RunService").Heartbeat:Connect(function(dt)
+        if stopped then return end
+        if gate.Parent==nil or os.clock()-lastHeartbeat>2.5 then stop();return end
+        local ok,err=pcall(function()
+            refreshClock+=dt;statusClock+=dt
+            if refreshClock>=0.25 then refreshClock=0;refresh() end
+            controller:Update(dt)
+            if statusClock>=0.15 then
+                statusClock=0
+                channel:Fire("snapshot",controller:Snapshot())
+            end
+        end)
+        if not ok then fail(err) end
+    end))
+    refresh()
+    channel:Fire("booted")
+end,debug.traceback)
+if not success then fail(startError) end
+]========]
+-- Operation One adapter: redirect only the native local Gun:send_shoot look.
+-- Spread, range, ray_damage, ammunition and the native shoot event remain native.
+local function createSilentAim(app,win,overlay,helpers)
+    local Players=game:GetService("Players")
+    local UIS=game:GetService("UserInputService")
+    local localPlayer=Players.LocalPlayer
+    local make=helpers.make
+    local settings={fov=150,range=1000,chance=100,hitbox="Head",priority="Crosshair",
+        visibleOnly=true,ignoreFriends=false,ignoreProtected=true,sticky=true,
+        holdRMB=false,adsOnly=false,showFov=true,showTarget=true}
+    local aim={enabled=false,ready=false,settings=settings,target=nil,error=nil,
+        stats={shots=0,redirected=0,missedChance=0,candidates=0},generation=0}
+    app.silentAim=aim
+    local module,originalSend,originalLook,wrappedSend,wrappedLook
+    local bridge
+    local scopes=setmetatable({},{__mode="k"})
+    local params=RaycastParams.new()
+    params.FilterType=Enum.RaycastFilterType.Exclude
+    params.IgnoreWater=true
+    local ring=make("Frame",{Name="SilentAimFOV",AnchorPoint=Vector2.new(0.5,0.5),
+        BackgroundTransparency=1,Visible=false,ZIndex=8},overlay)
+    make("UICorner",{CornerRadius=UDim.new(1,0)},ring)
+    local stroke=make("UIStroke",{Color=Color3.fromRGB(101,229,181),Thickness=1,Transparency=0.3},ring)
+    local marker=make("Frame",{Name="SilentAimTarget",AnchorPoint=Vector2.new(0.5,0.5),
+        Size=UDim2.fromOffset(8,8),BackgroundTransparency=1,Visible=false,ZIndex=9},overlay)
+    make("UICorner",{CornerRadius=UDim.new(1,0)},marker)
+    make("UIStroke",{Color=Color3.fromRGB(255,204,110),Thickness=1.5},marker)
+    local function aliveCharacter(char,player)
+        if not char or not char:IsDescendantOf(workspace) then return false end
+        local state=char:FindFirstChild("StateObject")
+        local owner=state and state:FindFirstChild("owner")
+        local clean=state and state:FindFirstChild("clean")
+        local hum=char:FindFirstChildOfClass("Humanoid")
+        return owner and owner:IsA("ObjectValue") and owner.Value==player
+            and clean and clean:IsA("BoolValue") and not clean.Value
+            and hum and hum.Health>0
+    end
+    local function ownsWeapon(weapon)
+        if type(weapon)~="table" then return false end
+        local owner=weapon.owner
+        return type(owner)=="table" and type(owner.values)=="table"
+            and owner.values.equipped==weapon and aliveCharacter(owner.instance,localPlayer)
+    end
+    local function activeInput()
+        return app.alive and aim.enabled and aim.ready and (not helpers.allowed or helpers.allowed())
+            and not UIS:GetFocusedTextBox()
+            and (not settings.holdRMB or UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton2))
+    end
+    local function visible(origin,position,entry,localChar,camera)
+        local ignore={camera}
+        if localChar then table.insert(ignore,localChar) end
+        local folder=workspace:FindFirstChild("Viewmodels")
+        local root=localChar and localChar:FindFirstChild("HumanoidRootPart")
+        if folder and root then
+            for _,rig in ipairs(folder:GetChildren()) do
+                local torso=rig:FindFirstChild("torso")
+                local motor=torso and torso:FindFirstChild("JointMotor")
+                if motor and motor:IsA("Motor6D") and motor.Part0==root then table.insert(ignore,rig) end
+            end
+        end
+        params.FilterDescendantsInstances=ignore
+        local delta=position-origin
+        if delta.Magnitude<0.001 then return false end
+        local hit=workspace:Raycast(origin,delta,params)
+        return hit==nil or hit.Instance:IsDescendantOf(entry.char)
+            or (entry.rig and hit.Instance:IsDescendantOf(entry.rig))
+    end
+    local function eligible(entry)
+        if entry.player==localPlayer or entry.player.Parent~=Players or helpers.ally(entry.player)
+            or not aliveCharacter(entry.char,entry.player) then return false end
+        if settings.ignoreFriends and (entry.friend or entry.friendKnown==false) then return false end
+        if settings.ignoreProtected and entry.char:FindFirstChildOfClass("ForceField") then return false end
+        -- A cached visual rig must still belong to the current live root.
+        if not entry.root or not entry.root:IsDescendantOf(entry.char) then return false end
+        if entry.rig~=entry.char then
+            local torso=entry.rig and entry.rig:FindFirstChild("torso")
+            local motor=torso and torso:FindFirstChild("JointMotor")
+            if not motor or not motor:IsA("Motor6D") or motor.Part0~=entry.root or motor.Part1~=torso then return false end
+        end
+        return true
+    end
+    local function selectTarget(origin,localChar,maxRange)
+        local camera=workspace.CurrentCamera
+        if not camera then return nil end
+        local center=camera.ViewportSize*0.5
+        local candidates={}
+        for _,entry in pairs(app.entries) do
+            if eligible(entry) then
+                local head=entry.parts.head or entry.parts.Head
+                local torso=entry.parts.torso or entry.parts.UpperTorso or entry.parts.Torso
+                local parts={}
+                if settings.hitbox~="Torso" and head then table.insert(parts,head) end
+                if settings.hitbox~="Head" and torso then table.insert(parts,torso) end
+                for _,part in ipairs(parts) do
+                    if part.Parent and part:IsDescendantOf(workspace) then
+                        local position=part.Position
+                        local projected,onScreen=camera:WorldToViewportPoint(position)
+                        local pixel=(Vector2.new(projected.X,projected.Y)-center).Magnitude
+                        local distance=(position-origin).Magnitude
+                        if onScreen and projected.Z>0 and pixel<=settings.fov and distance>0.01
+                            and distance<=math.min(settings.range,maxRange or 1000) then
+                            local score=pixel/math.max(1,settings.fov)
+                            if settings.priority=="Distance" then score=distance/1000
+                            elseif settings.priority=="Health" then score=entry.hum.Health/math.max(1,entry.hum.MaxHealth)+score*0.001 end
+                            if settings.sticky and aim.target and aim.target.entry.player==entry.player then score*=0.8 end
+                            table.insert(candidates,{entry=entry,part=part,position=position,score=score,
+                                pixel=pixel,distance=distance,screen=Vector2.new(projected.X,projected.Y)})
+                        end
+                    end
+                end
+            end
+        end
+        table.sort(candidates,function(a,b)
+            if a.score==b.score then return a.entry.player.UserId<b.entry.player.UserId end
+            return a.score<b.score
+        end)
+        aim.stats.candidates=#candidates
+        for _,candidate in ipairs(candidates) do
+            if not settings.visibleOnly or visible(origin,candidate.position,candidate.entry,localChar,camera) then
+                return candidate
+            end
+        end
+        return nil
+    end
+    local function detach()
+        -- Respect another script that replaced one of our methods after installation.
+        if module then
+            if module.send_shoot==wrappedSend then module.send_shoot=originalSend end
+            if module.get_shoot_look==wrappedLook then module.get_shoot_look=originalLook end
+        end
+        table.clear(scopes)
+        aim.ready=false
+    end
+    local function stopBridge()
+        local state=bridge
+        bridge=nil
+        if not state then return end
+        state.gate.Value=false;state.gate:Destroy()
+        state.event:Fire("stop")
+        -- Let the Actor consume the stop packet before releasing the channel.
+        task.delay(3,function()
+            state.connection:Disconnect()
+            state.event:Destroy()
+        end)
+    end
+    local function startBridge(generation)
+        assert(type(run_on_actor)=="function" and type(create_comm_channel)=="function",
+            "This runtime needs run_on_actor and create_comm_channel for Operation One.")
+        local scripts=localPlayer:FindFirstChild("PlayerScripts")
+        local actor=scripts and scripts:FindFirstChild("Folder")
+        assert(actor and actor:IsA("Actor") and actor:FindFirstChild("Loader"),"Operation One's gameplay Actor is unavailable.")
+        local id,event=create_comm_channel()
+        local gate=Instance.new("BoolValue")
+        gate.Name="SilentAimEnabled";gate.Value=false;gate.Parent=overlay
+        local state={event=event,gate=gate,lastMessage=os.clock(),heartbeat=0,revision=1}
+        bridge=state
+        state.connection=event.Event:Connect(function(kind,data,revision)
+            if bridge~=state or generation~=aim.generation or not app.alive then return end
+            if kind=="booted" then
+                event:Fire("settings",table.clone(settings),state.revision)
+            elseif kind=="ready" or kind=="snapshot" then
+                state.lastMessage=os.clock()
+                aim.stats=data.stats;aim.error=data.error;aim.ready=data.ready;aim.nativeWeapons=data.nativeWeapons
+                state.target=data
+                if data.error then aim:Enable(false);return end
+                if kind=="ready" and revision==state.revision then gate.Value=aim.enabled and data.ready end
+            elseif kind=="error" then
+                aim.error=tostring(data);aim:Enable(false)
+                if app.window then app.window:Notify(aim.error,4) end
+            end
+        end)
+        aim.adapter="Actor";aim.enabled=true
+        run_on_actor(actor,helpers.actorSource,id,gate)
+    end
+    local function attach()
+        assert(game.PlaceId==72920620366355,"Silent Aim supports Operation One only.")
+        local modules=game:GetService("ReplicatedStorage"):FindFirstChild("Modules")
+        local items=modules and modules:FindFirstChild("Items")
+        local item=items and items:FindFirstChild("Item")
+        local gun=item and item:FindFirstChild("Gun")
+        assert(gun and gun:IsA("ModuleScript"),"Native Gun module is unavailable.")
+        local loaded=helpers.resolveGun and helpers.resolveGun(gun) or require(gun)
+        assert(type(loaded)=="table" and type(loaded.send_shoot)=="function"
+            and type(loaded.get_shoot_look)=="function","Native Gun contract is unavailable.")
+        return loaded
+    end
+    function aim:Enable(on)
+        if on~=true then
+            self.enabled=false;self.generation+=1;self.target=nil
+            stopBridge();detach();ring.Visible=false;marker.Visible=false
+            if self.control then self.control:Set(false,false) end
+            return true
+        end
+        if not app.alive then return false end
+        if self.enabled and (self.ready or bridge) then return true end
+        self.generation+=1
+        local generation=self.generation
+        if helpers.actorSource and not helpers.nativeActor then
+            self.error=nil
+            local ok,err=pcall(startBridge,generation)
+            if not ok then self.error=tostring(err);self:Enable(false) end
+            if self.control then self.control:Set(self.enabled,false) end
+            return ok and self.enabled
+        end
+        local ok,loaded=pcall(attach)
+        if generation~=self.generation or not app.alive then return false end
+        if not ok then
+            self.error=tostring(loaded)
+            self:Enable(false)
+            if app.window then app.window:Notify(self.error,4) end
+            return false
+        end
+        module=loaded;originalSend=module.send_shoot;originalLook=module.get_shoot_look
+        local nativeSend,nativeLook=originalSend,originalLook
+        wrappedLook=function(weapon,...)
+            local base=nativeLook(weapon,...)
+            local scope=scopes[coroutine.running()]
+            if generation~=self.generation or not scope or scope.weapon~=weapon or not activeInput()
+                or not ownsWeapon(weapon) then return base end
+            if scope.decided then return scope.look or base end
+            scope.decided=true
+            local success,result=pcall(function()
+                if typeof(base)~="CFrame" then return nil end
+                if settings.adsOnly and (not weapon.states.sights or not weapon.states.sights:get()) then return nil end
+                if math.random()*100>=settings.chance then self.stats.missedChance+=1;return nil end
+                local pellets=weapon.states.pellets:get()
+                local target=selectTarget(base.Position,weapon.owner.instance,pellets>1 and 250 or 1000)
+                self.target=target
+                if not target then return nil end
+                self.stats.redirected+=1
+                -- Preserve muzzle position and let the native shot code apply its own spread/hit tests.
+                return CFrame.lookAt(base.Position,target.position,base.UpVector)
+            end)
+            if not success then
+                self.error=tostring(result);self:Enable(false)
+                return base
+            end
+            scope.look=result
+            return result or base
+        end
+        wrappedSend=function(weapon,...)
+            if generation~=self.generation or not self.enabled or not app.alive or not ownsWeapon(weapon) then return nativeSend(weapon,...) end
+            local thread=coroutine.running()
+            if scopes[thread] then return nativeSend(weapon,...) end
+            scopes[thread]={weapon=weapon,decided=false}
+            self.stats.shots+=1
+            local result=table.pack(pcall(nativeSend,weapon,...))
+            scopes[thread]=nil
+            if not result[1] then error(result[2],0) end
+            return table.unpack(result,2,result.n)
+        end
+        local installed,installError=pcall(function()
+            module.get_shoot_look=wrappedLook
+            module.send_shoot=wrappedSend
+        end)
+        if not installed then
+            self.error=tostring(installError);self:Enable(false);return false
+        end
+        self.error=nil;self.enabled=true;self.ready=true
+        self.adapter="Direct"
+        if self.control then self.control:Set(true,false) end
+        return true
+    end
+    function aim:Set(key,value)
+        if not app.alive or settings[key]==nil then return false end
+        if key=="fov" or key=="range" or key=="chance" then
+            if type(value)~="number" or value~=value or math.abs(value)==math.huge then return false end
+            local bounds={fov={30,600},range={10,1000},chance={0,100}}
+            value=math.clamp(value,bounds[key][1],bounds[key][2])
+        elseif key=="hitbox" then
+            if not table.find({"Head","Torso","Closest part"},value) then return false end
+        elseif key=="priority" then
+            if not table.find({"Crosshair","Distance","Health"},value) then return false end
+        elseif type(value)~="boolean" then return false end
+        settings[key]=value;self.target=nil
+        if bridge then
+            bridge.gate.Value=false
+            bridge.revision+=1
+            bridge.event:Fire("settings",table.clone(settings),bridge.revision)
+        end
+        local control=self.controls and self.controls[key]
+        if control then control:Set(value,false) end
+        return true
+    end
+    function aim:Snapshot()
+        return {enabled=self.enabled,ready=self.ready,error=self.error,
+            adapter=self.adapter,nativeWeapons=self.nativeWeapons,
+            target=self.target and self.target.entry.player.Name or nil,
+            targetUserId=self.target and self.target.entry.player.UserId or nil,
+            hitbox=self.target and self.target.part.Name or nil,stats=table.clone(self.stats),
+            settings=table.clone(settings)}
+    end
+    local clock,statusClock=0,0
+    function aim:Update(dt)
+        if not app.alive then return end
+        clock+=dt;statusClock+=dt
+        if bridge then
+            bridge.heartbeat+=dt
+            if bridge.heartbeat>=0.5 then bridge.heartbeat=0;bridge.event:Fire("heartbeat") end
+            if os.clock()-bridge.lastMessage>4 then
+                self.error="Gameplay Actor stopped responding. Toggle Silent Aim to reconnect."
+                self:Enable(false)
+            end
+        end
+        if self.enabled and not bridge and (module.send_shoot~=wrappedSend or module.get_shoot_look~=wrappedLook) then
+            self.error="Native weapon methods changed; toggle Silent Aim to reconnect."
+            self:Enable(false)
+        end
+        local camera=workspace.CurrentCamera
+        local active=camera and activeInput() and aliveCharacter(app.localCharacter,localPlayer)
+        ring.Visible=active and settings.showFov or false
+        marker.Visible=false
+        if active then
+            ring.Position=UDim2.fromOffset(camera.ViewportSize.X*0.5,camera.ViewportSize.Y*0.5)
+            ring.Size=UDim2.fromOffset(settings.fov*2,settings.fov*2)
+            if clock>=1/30 then
+                clock=0
+                if bridge then
+                    local state=bridge.target
+                    local selected
+                    if state and state.targetUserId then
+                        for player,entry in pairs(app.entries) do
+                            if player.UserId==state.targetUserId then
+                                local part=entry.parts[state.hitbox]
+                                if part then selected={entry=entry,part=part} end
+                                break
+                            end
+                        end
+                    end
+                    self.target=selected
+                else self.target=selectTarget(camera.CFrame.Position,app.localCharacter,1000) end
+            end
+            if self.target and eligible(self.target.entry) and self.target.part.Parent then
+                local p,onScreen=camera:WorldToViewportPoint(self.target.part.Position)
+                marker.Visible=settings.showTarget and onScreen
+                marker.Position=UDim2.fromOffset(p.X,p.Y)
+            end
+        else self.target=nil end
+        stroke.Transparency=self.target and 0.05 or 0.4
+        if statusClock>=0.25 and self.status then
+            statusClock=0
+            local state=not self.enabled and "Disabled" or not active and "Waiting for a live character / aim input" or "Searching inside FOV"
+            if self.target then state="Target: @"..self.target.entry.player.Name.." · "..self.target.part.Name end
+            self.status:SetText(self.error or string.format("%s\n%d shots · %d redirected looks",state,self.stats.shots,self.stats.redirected))
+        end
+    end
+    function aim:Unload()
+        self:Enable(false)
+        ring:Destroy();marker:Destroy()
+    end
+    local tab=win:Folder("Silent Aim")
+    local main=tab:Section("SILENT AIM")
+    aim.control=main:Toggle("Enable Silent Aim",function(on)aim:Enable(on)end,false)
+    main:Label("Native gun shots only · camera stays under your control.")
+    aim.status=main:Label("Disabled")
+    aim.controls={}
+    local function toggle(section,key,title)
+        aim.controls[key]=section:Toggle(title,function(v)aim:Set(key,v)end,settings[key])
+    end
+    toggle(main,"holdRMB","Only while holding right mouse")
+    toggle(main,"adsOnly","Only while aiming down sights")
+    local target=tab:Section("TARGET SELECTION")
+    aim.controls.hitbox=target:Dropdown("Hitbox",{"Head","Torso","Closest part"},function(v)aim:Set("hitbox",v)end,settings.hitbox)
+    aim.controls.priority=target:Dropdown("Priority",{"Crosshair","Distance","Health"},function(v)aim:Set("priority",v)end,settings.priority)
+    aim.controls.fov=target:Slider("FOV radius (pixels)",30,600,settings.fov,function(v)aim:Set("fov",v)end,5)
+    aim.controls.range=target:Slider("Maximum range (studs)",10,1000,settings.range,function(v)aim:Set("range",v)end,10)
+    aim.controls.chance=target:Slider("Redirect chance (%)",0,100,settings.chance,function(v)aim:Set("chance",v)end,1)
+    toggle(target,"sticky","Prefer the current target")
+    local filters=tab:Section("FILTERS & DISPLAY")
+    filters:Label("Teammates and dead/stale characters are always excluded.")
+    toggle(filters,"visibleOnly","Require a clear line of sight")
+    toggle(filters,"ignoreProtected","Ignore ForceField-protected players")
+    toggle(filters,"ignoreFriends","Ignore friends")
+    toggle(filters,"showFov","Show FOV circle")
+    toggle(filters,"showTarget","Show target marker")
+    return aim
+end
+
+-- The Operation One adapter maps torso.JointMotor.Part0 to Player.Character's root.
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+local HttpService = game:GetService("HttpService")
+local LocalPlayer = Players.LocalPlayer
+assert(LocalPlayer and RunService:IsClient(), "Smug ESP requires a client runtime.")
+local env = type(getgenv) == "function" and getgenv() or _G
+local old = env.SmugESP
+if old and type(old.Unload) == "function" then old:Unload() end
+-- The shared library must finish its bootstrap before any ESP UI or workers exist.
+local Library=loadSmugLibrary()
+assert(type(Library)=="table" and type(Library.CreateWindow)=="function","Failed to load SmugLib V2.")
+local app = {alive = true, enabled = false, entries = {}, objects = {}, connections = {}, controls = {},
+    stats = {drawn = 0, tracked = 0, rigs = 0, rays = 0, ms = 0}, version = "2026-11-06.7", error = nil}
+env.SmugESP = app
+local CONFIG_FILE = "SmugESP_OperationOne_v1.json"
+local defaults = {
+    elements = {"Box", "Name", "Health", "Distance", "Arrows", "Chams"},
+    box = "Corners", showEnemies = true, showAllies = false, colorMode = "Relationship", names = "Display + @username",
+    opacity = 100, thickness = 1, textSize = 13,
+    boxFill = 7, corner = 24, healthNumbers = true, outline = true,
+    visibleOnly = false, hideFriends = false, hideProtected = false, hideViewSubject = true,
+    visibleColor = "65E5B5", enemyColor = "FF6B7C", allyColor = "70B7FF", objectColor = "F6C76B",
+    hiddenColor = "CB91ED", visibilityColor = true, tracerOrigin = "Bottom",
+    headScale = 5, chamsFill = 85, chamsOutline = 15,
+    chamsMode = "Through walls", arrowRadius = 80, arrowSize = 11, arrowDistance = true,
+    radarSize = 160, radarSide = "Left", radarRotate = true,
+    refreshRate = 60, rayRate = 8, rayBudget = 3, objectLimit = 60, highlightBudget = 24, objectChamsReserve = 8,
+    hud = true, adaptive = true, objectDeclutter = true, objectRules = {},
+}
+local choices = {
+    box = {"Corners", "Rectangle", "3D"},
+    colorMode = {"Relationship", "Team", "Health", "Distance"}, names = {"Display + @username", "Display", "Username"},
+    tracerOrigin = {"Bottom", "Center", "Cursor"}, chamsMode = {"Through walls", "Visible only"},
+    radarSide = {"Left", "Right"},
+}
+local ranges = {
+    opacity={15,100},thickness={1,3},textSize={10,18},boxFill={0,45},corner={10,45},
+    headScale={2,12},chamsFill={0,100},chamsOutline={0,100},
+    arrowRadius={35,95},arrowSize={6,20},radarSize={110,260},refreshRate={15,120},
+    rayRate={2,20},rayBudget={1,8},objectLimit={1,150},highlightBudget={1,24},objectChamsReserve={0,16},
+}
+local elementNames = {"Box", "Name", "Health", "Distance", "Skeleton", "Head", "Tracers", "Arrows", "Chams", "Radar", "Equipment", "Status"}
+local C = table.clone(defaults)
+C.elements = table.clone(defaults.elements)
+-- Compatibility aliases for settings saved by the Czech UI.
+local legacyValues={
+    ["Jméno"]="Name",
+    ["Zdraví"]="Health",
+    ["Vzdálenost"]="Distance",
+    ["Kostra"]="Skeleton",
+    ["Hlava"]="Head",
+    ["Tracery"]="Tracers",
+    ["Šipky"]="Arrows",
+    ["Výbava"]="Equipment",
+    ["Stav"]="Status",
+    ["Rohy"]="Corners",
+    ["Obdélník"]="Rectangle",
+    ["Vztah"]="Relationship",
+    ["Display + @jméno"]="Display + @username",
+    ["Dole"]="Bottom",
+    ["Střed"]="Center",
+    ["Kurzor"]="Cursor",
+    ["Skrz stěny"]="Through walls",
+    ["Jen viditelné"]="Visible only",
+    ["Vlevo"]="Left",
+    ["Vpravo"]="Right",
+    ["Spojenci"]="Allies",
+    ["Nepřátelé"]="Enemies",
+    ["Vše"]="All",
+    ["Cizí"]="Other owners",
+    ["Vlastní"]="Owned",
+    ["Bez vlastníka"]="Unowned",
+    ["Miny a pasti"]="Mines & traps",
+    ["Kamery"]="Cameras",
+    ["Drony"]="Drones",
+    ["Výbušniny"]="Explosives",
+    ["Granáty"]="Grenades",
+    ["Cíle"]="Objectives",
+    ["Bariéry"]="Barriers",
+    ["@Jméno"]="@Name",
+    ["@Zdraví"]="@Health",
+    ["@Vzdálenost"]="@Distance",
+    ["@Kostra"]="@Skeleton",
+    ["@Hlava"]="@Head",
+    ["@Tracery"]="@Tracers",
+    ["@Šipky"]="@Arrows",
+    ["@Výbava"]="@Equipment",
+    ["@Stav"]="@Status",
+    ["@Rohy"]="@Corners",
+    ["@Obdélník"]="@Rectangle",
+    ["@Vztah"]="@Relationship",
+    ["@Display + @jméno"]="@Display + @username",
+    ["@Dole"]="@Bottom",
+    ["@Střed"]="@Center",
+    ["@Kurzor"]="@Cursor",
+    ["@Skrz stěny"]="@Through walls",
+    ["@Jen viditelné"]="@Visible only",
+    ["@Vlevo"]="@Left",
+    ["@Vpravo"]="@Right",
+    ["@Spojenci"]="@Allies",
+    ["@Nepřátelé"]="@Enemies",
+    ["@Vše"]="@All",
+    ["@Cizí"]="@Other owners",
+    ["@Vlastní"]="@Owned",
+    ["@Bez vlastníka"]="@Unowned",
+    ["@Miny a pasti"]="@Mines & traps",
+    ["@Kamery"]="@Cameras",
+    ["@Drony"]="@Drones",
+    ["@Výbušniny"]="@Explosives",
+    ["@Granáty"]="@Grenades",
+    ["@Cíle"]="@Objectives",
+    ["@Bariéry"]="@Barriers",
+}
+local function normalizeLegacy(value)
+    if type(value)=="string" then return legacyValues[value] or value end
+    return value
+end
+local function valid(key, value)
+    local d = defaults[key]
+    if d == nil then return nil end
+    if key == "objectRules" then
+        if type(value)~="table" then return nil end
+        local out={}
+        for id,rule in pairs(value) do
+            if type(id)=="string" and type(rule)=="table" then
+                local normalized=normalizeLegacy(id)
+                if out[normalized]==nil or normalized==id then out[normalized]=rule end
+            end
+        end
+        return out -- nested fields are validated by Objects.lua
+    elseif key == "elements" then
+        if type(value) ~= "table" then return nil end
+        local out = {}
+        local selected={}
+        for _,name in ipairs(value) do if type(name)=="string" then selected[normalizeLegacy(name)]=true end end
+        for _,name in ipairs(elementNames) do if selected[name] then table.insert(out,name) end end
+        return out
+    elseif ranges[key] then
+        if type(value) ~= "number" or value ~= value or math.abs(value) == math.huge then return nil end
+        return math.clamp(value, ranges[key][1], ranges[key][2])
+    elseif choices[key] then value=normalizeLegacy(value);return table.find(choices[key],value) and value or nil
+    elseif type(d)=="string" and key:find("Color$") then
+        return type(value) == "string" and value:gsub("#", ""):match("^%x%x%x%x%x%x$") or nil
+    elseif type(d) == "boolean" then
+        if type(value) == "boolean" then return value end
+        return nil
+    elseif type(d) == "string" and type(value) == "string" then return value:sub(1, 160) end
+    return nil
+end
+if type(readfile) == "function" then
+    local ok, data = pcall(function() return HttpService:JSONDecode(readfile(CONFIG_FILE)) end)
+    if ok and type(data) == "table" then
+        for key, value in pairs(data) do local v = valid(key, value); if v ~= nil then C[key] = v end end
+        if data.showEnemies==nil and data.filter then
+            local filter=normalizeLegacy(data.filter)
+            C.showEnemies=filter~="Allies";C.showAllies=filter~="Enemies"
+        end
+    end
+end
+local features, colors = {}, {}
+local function rebuild()
+    table.clear(features)
+    for _, name in ipairs(C.elements) do features[name] = true end
+    for key, value in pairs(C) do
+        if type(defaults[key])=="string" and key:find("Color$") then colors[key] = Color3.fromHex(value) end
+    end
+end
+rebuild()
+local function connect(signal, callback)
+    local connection = signal:Connect(callback)
+    table.insert(app.connections, connection)
+    return connection
+end
+local function make(class, properties, parent)
+    local instance = Instance.new(class)
+    for k, v in pairs(properties or {}) do instance[k] = v end
+    instance.Parent = parent
+    return instance
+end
+local guiParent = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+if type(gethui) == "function" then local ok, p = pcall(gethui); if ok and p then guiParent = p end end
+guiParent = guiParent or game:GetService("CoreGui")
+local overlay = make("ScreenGui", {Name="SmugESP_Overlay", ResetOnSpawn=false, IgnoreGuiInset=true,
+    DisplayOrder=9, ZIndexBehavior=Enum.ZIndexBehavior.Sibling}, guiParent)
+app.gui = overlay
+local highlights = make("Folder", {Name="SmugESP_Highlights"}, workspace)
+local layer = make("Frame", {Name="Canvas",Size=UDim2.fromScale(1,1),BackgroundTransparency=1}, overlay)
+local function text(parent, size)
+    local label = make("TextLabel", {BackgroundTransparency=1,BorderSizePixel=0,Font=Enum.Font.Code,
+        TextSize=size or 13,TextColor3=Color3.new(1,1,1),Text="",RichText=false,TextTruncate=Enum.TextTruncate.AtEnd,
+        Size=UDim2.fromOffset(260,20),AnchorPoint=Vector2.new(0.5,0.5),ZIndex=5}, parent)
+    make("UIStroke", {Thickness=1,Color=Color3.new(0,0,0),Transparency=0.15}, label)
+    return label
+end
+local hud = text(layer,12)
+hud.Name = "Status"
+hud.AnchorPoint = Vector2.zero
+hud.Position = UDim2.fromOffset(20,76)
+hud.Size = UDim2.fromOffset(380,22)
+hud.TextXAlignment = Enum.TextXAlignment.Left
+local radar = make("Frame", {Name="Radar",BackgroundColor3=Color3.fromRGB(14,17,23),BackgroundTransparency=0.14,
+    BorderSizePixel=0,Visible=false,ZIndex=2},layer)
+make("UICorner",{CornerRadius=UDim.new(0,8)},radar)
+make("UIStroke",{Color=Color3.fromRGB(69,79,95),Transparency=0.3},radar)
+local radarCaption = text(radar,11)
+radarCaption.Position=UDim2.new(0.5,0,0,14)
+radarCaption.Text="RADAR"
+local radarRange = text(radar,10)
+radarRange.Position=UDim2.new(0.5,0,1,-12)
+local radarH = make("Frame",{BorderSizePixel=0,BackgroundColor3=Color3.fromRGB(64,72,88),Size=UDim2.new(1,-20,0,1),Position=UDim2.new(0,10,0.5,0),ZIndex=2},radar)
+make("Frame",{BorderSizePixel=0,BackgroundColor3=radarH.BackgroundColor3,Size=UDim2.new(0,1,1,-44),Position=UDim2.new(0.5,0,0,24),ZIndex=2},radar)
+local radarSelf = text(radar,14)
+radarSelf.Size=UDim2.fromOffset(16,16);radarSelf.Position=UDim2.fromScale(0.5,0.5);radarSelf.Text="▲"
+local function newEntry(player)
+    local e={player=player, frame=make("Frame",{Name=tostring(player.UserId),BackgroundTransparency=1,
+        Size=UDim2.fromScale(1,1),Visible=false},layer),lines={},lineIndex=0,visible=false,checked=0,
+        parts={},rig=nil,char=nil,root=nil,hum=nil,friend=false,friendKnown=false,labels={}}
+    for _,name in ipairs({"name","info","detail","hp","arrow"}) do e.labels[name]=text(e.frame,C.textSize) end
+    e.fill=make("Frame",{Name="BoxFill",BorderSizePixel=0,BackgroundTransparency=1,Visible=false,ZIndex=1},e.frame)
+    e.healthBG=make("Frame",{BorderSizePixel=0,BackgroundColor3=Color3.fromRGB(8,10,14),Visible=false,ZIndex=3},e.frame)
+    e.healthFill=make("Frame",{BorderSizePixel=0,ZIndex=4},e.healthBG)
+    e.head=make("Frame",{BackgroundTransparency=1,BorderSizePixel=0,Visible=false,ZIndex=4},e.frame)
+    make("UICorner",{CornerRadius=UDim.new(1,0)},e.head)
+    e.headStroke=make("UIStroke",{Thickness=1},e.head)
+    e.dot=make("Frame",{Size=UDim2.fromOffset(5,5),AnchorPoint=Vector2.new(0.5,0.5),BorderSizePixel=0,Visible=false,ZIndex=4},radar)
+    make("UICorner",{CornerRadius=UDim.new(1,0)},e.dot)
+    app.entries[player]=e
+    task.spawn(function()
+        local ok, isFriend = pcall(LocalPlayer.IsFriendsWith, LocalPlayer, player.UserId)
+        if app.alive and app.entries[player]==e and ok then e.friend=isFriend;e.friendKnown=true end
+    end)
+    return e
+end
+local function hide(e)
+    e.frame.Visible=false;if e.highlight then e.highlight.Enabled=false end;e.dot.Visible=false
+end
+local function destroyEntry(e)
+    e.frame:Destroy();if e.highlight then e.highlight:Destroy() end;e.dot:Destroy()
+end
+function app:Set(key,value)
+    if not self.alive then return false end
+    local v=valid(key,value)
+    if v==nil then return false end
+    C[key]=v;rebuild()
+    if key=="elements" then
+        for name,elementControl in pairs(self.elementControls or {}) do elementControl:Set(features[name]==true) end
+    end
+    local control=self.controls[key]
+    if control then
+        if key=="elements" then control:SetSelected(v) else control:Set(v,false) end
+    end
+    for _,binding in ipairs(self.customControls or {}) do binding.control:Set(binding.get()) end
+    return true
+end
+function app:Enable(on)
+    if not self.alive then return end
+    self.enabled=on==true
+    if self.master then self.master:Set(self.enabled,false) end
+    if not self.enabled then
+        for _,e in pairs(self.entries) do hide(e);if e.highlight then e.highlight:Destroy();e.highlight=nil end end
+        if self.objectESP then self.objectESP:Hide() end
+        radar.Visible=false
+        self.stats.drawn=0;self.stats.objects=0;self.stats.objectChams=0;self.stats.playerChams=0
+    end
+end
+function app:Unload()
+    if not self.alive then return end
+    self.alive=false;self.enabled=false
+    if self.silentAim then self.silentAim:Unload() end
+    for _,c in ipairs(self.connections) do c:Disconnect() end
+    table.clear(self.connections)
+    if self.window then self.window:Kill() end
+    if self.gui then self.gui:Destroy() end
+    highlights:Destroy()
+    table.clear(self.entries);table.clear(self.objects)
+    if env.SmugESP==self then env.SmugESP=nil end
+end
+function app:Snapshot()
+    local result=table.clone(self.stats)
+    result.enabled=self.enabled;result.alive=self.alive;result.error=self.error;result.version=self.version
+    if self.silentAim then result.silentAim=self.silentAim:Snapshot() end
+    return result
+end
+function app:GetSettings()
+    return HttpService:JSONDecode(HttpService:JSONEncode(C))
+end
+-- Exact root identity; never match anonymous Viewmodels by proximity or display name.
+local function rigMap()
+    local mapped={}
+    local folder=workspace:FindFirstChild("Viewmodels")
+    if game.PlaceId==72920620366355 and folder then
+        for _,model in ipairs(folder:GetChildren()) do
+            local torso=model:FindFirstChild("torso")
+            local motor=torso and torso:FindFirstChild("JointMotor")
+            if motor and motor:IsA("Motor6D") and motor.Part0 and motor.Part1==torso then
+                mapped[motor.Part0]=model
+            end
+        end
+    end
+    return mapped
+end
+local bodyNames={head=true,torso=true,arm1=true,arm2=true,leg1=true,leg2=true,shoulder1=true,shoulder2=true,hip1=true,hip2=true,
+    Head=true,Torso=true,UpperTorso=true,LowerTorso=true,["Left Arm"]=true,["Right Arm"]=true,["Left Leg"]=true,["Right Leg"]=true,
+    LeftUpperArm=true,LeftLowerArm=true,LeftHand=true,RightUpperArm=true,RightLowerArm=true,RightHand=true,
+    LeftUpperLeg=true,LeftLowerLeg=true,LeftFoot=true,RightUpperLeg=true,RightLowerLeg=true,RightFoot=true}
+local function teamOf(player)
+    return player:GetAttribute("Team") or (not player.Neutral and player.Team and player.Team.Name) or nil
+end
+local function ally(player)
+    local a,b=teamOf(LocalPlayer),teamOf(player)
+    return a~=nil and b~=nil and a==b
+end
+local function equipped(char)
+    local config=char and char:FindFirstChild("Character")
+    local value=config and config:FindFirstChild("equipped")
+    if value and value:IsA("ObjectValue") and value.Value then return value.Value.Name end
+    local tool=char and char:FindFirstChildOfClass("Tool")
+    return tool and tool.Name or nil
+end
+local function refreshEntries()
+    local mapped=rigMap()
+    local owned={}
+    if game.PlaceId==72920620366355 then
+        for _,model in ipairs(workspace:GetChildren()) do
+            if model:IsA("Model") then
+                local state=model:FindFirstChild("StateObject")
+                local owner=state and state:FindFirstChild("owner")
+                local clean=state and state:FindFirstChild("clean")
+                local player=owner and owner:IsA("ObjectValue") and owner.Value
+                local humanoid=model:FindFirstChildOfClass("Humanoid")
+                if player and player:IsA("Player") and clean and clean:IsA("BoolValue") and not clean.Value
+                    and humanoid and humanoid.Health>0 and model:FindFirstChild("HumanoidRootPart") then
+                    local prior=owned[player]
+                    if not prior or model==player.Character or mapped[model.HumanoidRootPart] then owned[player]=model end
+                end
+            end
+        end
+    end
+    app.localCharacter=owned[LocalPlayer]
+    local count,rigs,live=0,0,0
+    for player,e in pairs(app.entries) do
+        count+=1
+        local char
+        if game.PlaceId==72920620366355 then char=owned[player] else char=player.Character end
+        local root=char and char:FindFirstChild("HumanoidRootPart")
+        local rig=root and mapped[root] or char
+        if e.char~=char or e.rig~=rig then e.checked=0;e.visible=false;e.boundsAt=nil end
+        e.char=char;e.root=root;e.hum=char and char:FindFirstChildOfClass("Humanoid");e.rig=rig
+        if root then live+=1 end
+        e.weapon=equipped(char);e.allied=ally(player)
+        table.clear(e.parts)
+        if rig then
+            for _,part in ipairs(rig:GetChildren()) do
+                if part:IsA("BasePart") and bodyNames[part.Name] then e.parts[part.Name]=part end
+            end
+        end
+        e.headPart=e.parts.head or e.parts.Head
+        if e.headPart then rigs+=1 end
+    end
+    app.stats.tracked=count;app.stats.rigs=rigs;app.stats.live=live
+end
+function app:Refresh()
+    if not self.alive then return end
+    refreshEntries()
+    if self.objectESP then self.objectESP:Refresh() end
+end
+local rayParams=RaycastParams.new()
+rayParams.FilterType=Enum.RaycastFilterType.Exclude
+rayParams.IgnoreWater=true
+local rayCursor=0
+local function updateVisibility(camera,now)
+    if not (C.visibleOnly or C.visibilityColor or features.Status) then return end
+    local candidates={}
+    for _,e in pairs(app.entries) do
+        if e.root and e.root:IsDescendantOf(workspace) and e.hum and e.hum.Health>0 then table.insert(candidates,e) end
+    end
+    local n=#candidates
+    if n==0 then return end
+    local ignore={camera}
+    if LocalPlayer.Character then table.insert(ignore,LocalPlayer.Character) end
+    local folder=workspace:FindFirstChild("Viewmodels")
+    if folder then table.insert(ignore,folder) end
+    for _,e in ipairs(candidates) do table.insert(ignore,e.char) end
+    rayParams.FilterDescendantsInstances=ignore
+    for _=1,math.min(C.rayBudget,n) do
+        rayCursor=rayCursor%n+1
+        local e=candidates[rayCursor]
+        local part=e.headPart or e.root
+        if part and part.Parent then
+            local origin=camera.CFrame.Position
+            local delta=part.Position-origin
+            local result=workspace:Raycast(origin,delta,rayParams)
+            e.visible=result==nil or (e.rig and result.Instance:IsDescendantOf(e.rig))
+            e.checked=now;app.stats.rays+=1
+        end
+    end
+end
+local function colorFor(e,distance,health)
+    if C.colorMode=="Health" then return Color3.fromRGB(255,92,104):Lerp(Color3.fromRGB(101,229,181),health) end
+    if C.colorMode=="Distance" then return colors.enemyColor:Lerp(colors.allyColor,distance/(distance+300)) end
+    if C.colorMode=="Team" and e.player.Team then return e.player.Team.TeamColor.Color end
+    if C.visibilityColor and not e.allied then
+        if e.visible then return colors.visibleColor end
+        if e.checked>0 then return colors.hiddenColor end
+    end
+    return e.allied and colors.allyColor or colors.enemyColor
+end
+local function line(e,a,b,color,alpha,width)
+    if (b-a).Magnitude<0.2 then return end
+    e.lineIndex+=1
+    local pair=e.lines[e.lineIndex]
+    if not pair then
+        local shadow=make("Frame",{AnchorPoint=Vector2.new(0.5,0.5),BorderSizePixel=0,BackgroundColor3=Color3.new(0,0,0),ZIndex=2},e.frame)
+        local foreground=make("Frame",{AnchorPoint=Vector2.new(0.5,0.5),BorderSizePixel=0,ZIndex=3},e.frame)
+        pair={shadow,foreground};e.lines[e.lineIndex]=pair
+    end
+    local delta=b-a;local center=(a+b)*0.5
+    local rotation=math.deg(math.atan2(delta.Y,delta.X));local length=delta.Magnitude
+    for i,f in ipairs(pair) do
+        f.Position=UDim2.fromOffset(center.X,center.Y);f.Size=UDim2.fromOffset(length,width+(i==1 and 2 or 0));f.Rotation=rotation
+        f.BackgroundTransparency=1-alpha*(i==1 and 0.75 or 1);f.Visible=i==2 or C.outline
+    end
+    pair[2].BackgroundColor3=color
+end
+local function labelAt(label,value,x,y,color,alpha,width)
+    label.Text=value;label.TextSize=C.textSize;label.TextColor3=color;label.TextTransparency=1-alpha
+    label.Position=UDim2.fromOffset(x,y);label.Size=UDim2.fromOffset(width or 260,C.textSize+6);label.Visible=true
+    local stroke=label:FindFirstChildOfClass("UIStroke")
+    if stroke then stroke.Enabled=C.outline;stroke.Transparency=1-alpha*0.85 end
+end
+local function project(camera,position)
+    local v=camera:WorldToViewportPoint(position)
+    return Vector2.new(v.X,v.Y),v.Z
+end
+local signs={Vector3.new(-1,-1,-1),Vector3.new(1,-1,-1),Vector3.new(1,1,-1),Vector3.new(-1,1,-1),
+    Vector3.new(-1,-1,1),Vector3.new(1,-1,1),Vector3.new(1,1,1),Vector3.new(-1,1,1)}
+local edges={{1,2},{2,3},{3,4},{4,1},{5,6},{6,7},{7,8},{8,5},{1,5},{2,6},{3,7},{4,8}}
+local customBones={{"head","torso"},{"torso","hip1"},{"hip1","leg1"},{"hip1","hip2"},{"hip2","leg2"},
+    {"torso","shoulder1"},{"shoulder1","arm1"},{"torso","shoulder2"},{"shoulder2","arm2"}}
+local r6Bones={{"Head","Torso"},{"Torso","Left Arm"},{"Torso","Right Arm"},{"Torso","Left Leg"},{"Torso","Right Leg"}}
+local r15Bones={{"Head","UpperTorso"},{"UpperTorso","LowerTorso"},{"UpperTorso","LeftUpperArm"},{"LeftUpperArm","LeftLowerArm"},
+    {"LeftLowerArm","LeftHand"},{"UpperTorso","RightUpperArm"},{"RightUpperArm","RightLowerArm"},{"RightLowerArm","RightHand"},
+    {"LowerTorso","LeftUpperLeg"},{"LeftUpperLeg","LeftLowerLeg"},{"LeftLowerLeg","LeftFoot"},
+    {"LowerTorso","RightUpperLeg"},{"RightUpperLeg","RightLowerLeg"},{"RightLowerLeg","RightFoot"}}
+-- Bounds contain body parts only: hats, weapons and long barrels cannot enlarge the box.
+local function bounds(e,camera)
+    local frame=e.root.CFrame
+    local lo,hi=Vector3.new(math.huge,math.huge,math.huge),Vector3.new(-math.huge,-math.huge,-math.huge)
+    local count=0
+    for _,part in pairs(e.parts) do
+        if part.Parent then
+            count+=1
+            for _,sign in ipairs(signs) do
+                local q=frame:PointToObjectSpace(part.CFrame:PointToWorldSpace(part.Size*sign*0.5))
+                lo=Vector3.new(math.min(lo.X,q.X),math.min(lo.Y,q.Y),math.min(lo.Z,q.Z))
+                hi=Vector3.new(math.max(hi.X,q.X),math.max(hi.Y,q.Y),math.max(hi.Z,q.Z))
+            end
+        end
+    end
+    if count==0 then
+        -- Spawn/streaming fallback uses the actual owned collider, never an invented skeleton.
+        local collision=e.char and e.char:FindFirstChild("collision")
+        if not collision or not collision:IsA("BasePart") then return nil end
+        frame=collision.CFrame;lo=-collision.Size*0.5;hi=collision.Size*0.5
+    end
+    local center=frame*CFrame.new((lo+hi)*0.5)
+    local half=(hi-lo)*0.5+Vector3.new(0.08,0.08,0.08)
+    local points={};local x0,y0,x1,y1=math.huge,math.huge,-math.huge,-math.huge
+    for i,sign in ipairs(signs) do
+        local p,z=project(camera,center:PointToWorldSpace(half*sign))
+        if z<0.15 then return nil end -- near-plane clipping: no exploding boxes
+        points[i]=p;x0=math.min(x0,p.X);y0=math.min(y0,p.Y);x1=math.max(x1,p.X);y1=math.max(y1,p.Y)
+    end
+    return x0,y0,x1,y1,points
+end
+local function drawBox(e,x0,y0,x1,y1,points,color,alpha)
+    local w,h=x1-x0,y1-y0
+    if C.box=="3D" then
+        for _,edge in ipairs(edges) do line(e,points[edge[1]],points[edge[2]],color,alpha,C.thickness) end
+    elseif C.box=="Rectangle" then
+        local p={Vector2.new(x0,y0),Vector2.new(x1,y0),Vector2.new(x1,y1),Vector2.new(x0,y1)}
+        for i=1,4 do line(e,p[i],p[i%4+1],color,alpha,C.thickness) end
+    else
+        local len=math.min(w,h)*C.corner/100
+        for _,v in ipairs({{x0,y0,1,1},{x1,y0,-1,1},{x0,y1,1,-1},{x1,y1,-1,-1}}) do
+            local p=Vector2.new(v[1],v[2]);line(e,p,p+Vector2.new(len*v[3],0),color,alpha,C.thickness)
+            line(e,p,p+Vector2.new(0,len*v[4]),color,alpha,C.thickness)
+        end
+    end
+    if C.boxFill>0 and C.box~="3D" then
+        e.fill.Position=UDim2.fromOffset(x0,y0);e.fill.Size=UDim2.fromOffset(w,h);e.fill.BackgroundColor3=color
+        e.fill.BackgroundTransparency=1-C.boxFill/100*alpha;e.fill.Visible=true
+    end
+end
+local function drawArrow(e,camera,viewport,position,color,alpha,distance)
+    local relative=camera.CFrame:PointToObjectSpace(position)
+    local dir=Vector2.new(relative.X,-relative.Y)
+    if relative.Z>0 then dir=Vector2.new(relative.X,math.max(math.abs(relative.Y),0.35)) end
+    if dir.Magnitude<0.01 then dir=Vector2.new(0,1) end
+    dir=dir.Unit
+    local center=viewport*0.5
+    local radius=Vector2.new(math.max(30,center.X-55),math.max(30,center.Y-70))*C.arrowRadius/100
+    local p=center+Vector2.new(dir.X*radius.X,dir.Y*radius.Y)
+    local bin=math.floor(math.atan2(dir.Y,dir.X)/0.10)
+    local lane=app.arrowBins[bin] or 0;app.arrowBins[bin]=lane+1
+    local offset=math.ceil(lane/2)*(lane%2==0 and -1 or 1)*28
+    p+=Vector2.new(-dir.Y,dir.X)*offset
+    p=Vector2.new(math.clamp(p.X,40,viewport.X-40),math.clamp(p.Y,55,viewport.Y-55))
+    local back=p-dir*C.arrowSize*1.6;local side=Vector2.new(-dir.Y,dir.X)*C.arrowSize*0.6
+    line(e,p,back+side,color,alpha,2);line(e,p,back-side,color,alpha,2);line(e,back+side,back-side,color,alpha,1)
+    if C.arrowDistance then labelAt(e.labels.arrow,string.format("%.0f",distance),back.X-dir.X*20,back.Y-dir.Y*20,color,alpha,60) end
+end
+local function drawRadar(e,camera,distance,color)
+    if not features.Radar or not radar.Visible then return end
+    local delta=e.root.Position-camera.CFrame.Position
+    local v
+    if C.radarRotate then
+        local forward=Vector3.new(camera.CFrame.LookVector.X,0,camera.CFrame.LookVector.Z)
+        if forward.Magnitude<0.001 then forward=Vector3.new(0,0,-1) else forward=forward.Unit end
+        local right=Vector3.new(-forward.Z,0,forward.X)
+        v=Vector2.new(delta:Dot(right),-delta:Dot(forward))
+    else v=Vector2.new(delta.X,delta.Z) end
+    local unit=v/(app.radarRange or 250)
+    if unit.Magnitude>1 then unit=unit.Unit end
+    local p=Vector2.new(C.radarSize,C.radarSize)*0.5+unit*(C.radarSize*0.5-27)
+    e.dot.Position=UDim2.fromOffset(p.X,p.Y);e.dot.BackgroundColor3=color;e.dot.Visible=true
+end
+local function eligible(e,camera,now)
+    if not e.player.Parent or not e.char or not e.root or not e.root:IsDescendantOf(workspace) or not e.hum or e.hum.Health<=0 then return nil end
+    local subject=camera.CameraSubject
+    if C.hideViewSubject and subject and subject:IsDescendantOf(e.char) and e.headPart
+        and (e.headPart.Position-camera.CFrame.Position).Magnitude<3 then return nil end
+    if e.allied and not C.showAllies or not e.allied and not C.showEnemies then return nil end
+    if C.hideFriends and e.friend then return nil end
+    if C.hideProtected and e.char:FindFirstChildOfClass("ForceField") then return nil end
+    local distance=(e.root.Position-camera.CFrame.Position).Magnitude
+    if C.visibleOnly and (not e.visible or now-e.checked>math.max(0.5,app.stats.tracked/C.rayBudget/C.rayRate*2)) then return nil end
+    return distance
+end
+local function drawPlayer(e,camera,viewport,distance,allowChams)
+    e.frame.Visible=true;e.lineIndex=0;e.fill.Visible=false;e.healthBG.Visible=false;e.head.Visible=false
+    for _,label in pairs(e.labels) do label.Visible=false end
+    local fraction=math.clamp(e.hum.Health/math.max(e.hum.MaxHealth,1),0,1)
+    local color=colorFor(e,distance,fraction)
+    local alpha=C.opacity/100
+    drawRadar(e,camera,distance,color)
+    local pos,onScreen=camera:WorldToViewportPoint((e.headPart or e.root).Position)
+    local x0,y0,x1,y1,points=bounds(e,camera)
+    local boxOnScreen=x0 and x1>0 and x0<viewport.X and y1>0 and y0<viewport.Y
+    if boxOnScreen then
+        local cx=(x0+x1)*0.5
+        if features.Box then drawBox(e,x0,y0,x1,y1,points,color,alpha) end
+        if features["Name"] then
+            local name=e.player.DisplayName
+            if C.names=="Username" then name="@"..e.player.Name
+            elseif C.names=="Display + @username" and name~=e.player.Name then name=name.."  @"..e.player.Name end
+            labelAt(e.labels.name,name,cx,y0-C.textSize*0.8-3,color,alpha,math.clamp(x1-x0+130,160,360))
+        end
+        local info={}
+        if features["Distance"] then table.insert(info,string.format("%.0f studs",distance)) end
+        if features.Status then table.insert(info,e.checked==0 and "?" or e.visible and "VISIBLE" or "OCCLUDED") end
+        if #info>0 then labelAt(e.labels.info,table.concat(info," · "),cx,y1+C.textSize*0.8+2,Color3.fromRGB(224,229,239),alpha) end
+        if features["Equipment"] and e.weapon then labelAt(e.labels.detail,e.weapon,cx,y1+C.textSize*1.9+4,color,alpha) end
+        if features["Health"] then
+            e.healthBG.Position=UDim2.fromOffset(x0-7,y0-1);e.healthBG.Size=UDim2.fromOffset(4,y1-y0+2);e.healthBG.Visible=true
+            e.healthBG.BackgroundTransparency=1-alpha*0.85
+            e.healthFill.AnchorPoint=Vector2.new(0,1);e.healthFill.Position=UDim2.new(0,1,1,-1)
+            e.healthFill.Size=UDim2.new(1,-2,fraction,-2*fraction)
+            e.healthFill.BackgroundColor3=Color3.fromRGB(255,92,104):Lerp(Color3.fromRGB(101,229,181),fraction)
+            e.healthFill.BackgroundTransparency=1-alpha
+            if C.healthNumbers then labelAt(e.labels.hp,tostring(math.ceil(e.hum.Health)),x0-24,y0+(y1-y0)*(1-fraction),e.healthFill.BackgroundColor3,alpha,36) end
+        end
+        if features.Skeleton then
+            local bones=e.parts.head and customBones or e.parts.UpperTorso and r15Bones or r6Bones
+            for _,bone in ipairs(bones) do
+                local a,b=e.parts[bone[1]],e.parts[bone[2]]
+                if a and b and a.Parent and b.Parent then
+                    local p,z=project(camera,a.Position);local q,z2=project(camera,b.Position)
+                    if z>0.15 and z2>0.15 then line(e,p,q,color,alpha,C.thickness) end
+                end
+            end
+        end
+        if features.Head and e.headPart and pos.Z>0.15 then
+            local size=math.clamp((y1-y0)*C.headScale/100,3,28)
+            e.head.Position=UDim2.fromOffset(pos.X-size,pos.Y-size);e.head.Size=UDim2.fromOffset(size*2,size*2)
+            e.headStroke.Color=color;e.headStroke.Transparency=1-alpha;e.head.Visible=true
+        end
+        if features.Tracers then
+            local origin=Vector2.new(viewport.X*0.5,viewport.Y-3)
+            if C.tracerOrigin=="Center" then origin=viewport*0.5
+            elseif C.tracerOrigin=="Cursor" then origin=UIS:GetMouseLocation() end
+            line(e,origin,Vector2.new(cx,y1),color,alpha*0.65,C.thickness)
+        end
+    elseif features["Arrows"] then drawArrow(e,camera,viewport,e.root.Position,color,alpha,distance) end
+    for i=e.lineIndex+1,#e.lines do e.lines[i][1].Visible=false;e.lines[i][2].Visible=false end
+    local useChams=allowChams and features.Chams==true and e.headPart~=nil
+    if useChams then
+        if not e.highlight then e.highlight=make("Highlight",{Name=tostring(e.player.UserId),Enabled=false},highlights) end
+        e.highlight.Enabled=true
+        e.highlight.Adornee=e.rig;e.highlight.FillColor=color;e.highlight.OutlineColor=color
+        e.highlight.FillTransparency=1-(1-C.chamsFill/100)*alpha
+        e.highlight.OutlineTransparency=1-(1-C.chamsOutline/100)*alpha
+        e.highlight.DepthMode=C.chamsMode=="Visible only" and Enum.HighlightDepthMode.Occluded or Enum.HighlightDepthMode.AlwaysOnTop
+    elseif e.highlight then e.highlight:Destroy();e.highlight=nil
+    end
+    return useChams
+end
+local refreshClock,rayClock,renderClock,statusClock=0,0,0,0
+local function render(dt)
+    if not app.alive then return end
+    refreshClock+=dt;rayClock+=dt;renderClock+=dt;statusClock+=dt
+    if refreshClock>=0.4 then refreshClock=0;refreshEntries() end
+    local camera=workspace.CurrentCamera
+    if not camera then return end
+    hud.Visible=C.hud
+    if statusClock>=0.5 then
+        statusClock=0
+        hud.Text=string.format("SMUG / ESP  %s  ·  %d/%d  ·  %.2f ms",app.enabled and "ON" or "OFF",app.stats.drawn,app.stats.tracked,app.stats.ms)
+        hud.TextColor3=app.enabled and colors.visibleColor or Color3.fromRGB(159,168,185)
+    end
+    if not app.enabled then return end
+    local hz=C.adaptive and app.stats.ms>5 and math.min(C.refreshRate,30) or C.refreshRate
+    if renderClock<1/hz then return end
+    local elapsed=renderClock;renderClock=0
+    local started=os.clock();local now=started;local viewport=camera.ViewportSize
+    if rayClock>=1/C.rayRate then rayClock=0;updateVisibility(camera,now) end
+    radar.Visible=features.Radar==true
+    if radar.Visible then
+        radar.Size=UDim2.fromOffset(C.radarSize,C.radarSize)
+        radar.Position=C.radarSide=="Left" and UDim2.new(0,20,1,-C.radarSize-30) or UDim2.new(1,-C.radarSize-20,1,-C.radarSize-30)
+        if not C.radarRotate then
+            local look=camera.CFrame.LookVector;radarSelf.Rotation=math.deg(math.atan2(look.X,-look.Z))
+        else radarSelf.Rotation=0 end
+    end
+    local selected={}
+    for _,e in pairs(app.entries) do
+        hide(e)
+        local distance=eligible(e,camera,now)
+        if distance then table.insert(selected,{e=e,distance=distance}) end
+    end
+    table.sort(selected,function(a,b)return a.distance<b.distance end)
+    app.radarRange=math.max(50,#selected>0 and selected[#selected].distance*1.05 or 250)
+    radarRange.Text=string.format("%.0f studs · AUTO",app.radarRange)
+    local drawn,playerChams=0,0
+    local objectDemand=app.objectESP and app.objectESP:ChamsDemand() or 0
+    local playerBudget=math.max(0,C.highlightBudget-math.min(objectDemand,C.objectChamsReserve))
+    app.arrowBins={}
+    for i=1,#selected do
+        local s=selected[i]
+        if drawPlayer(s.e,camera,viewport,s.distance,playerChams<playerBudget) then playerChams+=1 end
+        drawn+=1
+    end
+    for _,e in pairs(app.entries) do
+        if e.highlight and not e.highlight.Enabled then e.highlight:Destroy();e.highlight=nil end
+    end
+    if app.objectESP then app.objectESP:Render(camera,elapsed,math.max(0,C.highlightBudget-playerChams)) end
+    app.stats.playerChams=playerChams
+    app.stats.drawn=drawn
+    app.stats.ms=app.stats.ms*0.8+(os.clock()-started)*1000*0.2
+end
+-- Everything after bootstrap is owned by app and shares the same cleanup path.
+local ok,err=xpcall(function()
+    assert(app.alive, "ESP was unloaded during startup.")
+    local win=Library:CreateWindow("SMUG / ESP",{Width=400,Height=520,ToggleKey=Enum.KeyCode.RightShift,
+        ConfigKey="SmugESP_UI_v1",ConfigAutoSave=false,AccentColor=Color3.fromRGB(65,143,130),
+        AccentLightColor=Color3.fromRGB(101,229,181),SectionHeaderColor=Color3.fromRGB(29,39,44),OnClose=function()app:Unload()end})
+    app.window=win
+    -- SmugLib reads persistence during construction even with autosave disabled.
+    -- Clear those bindings before adding controls; ESP owns its validated, non-active settings.
+    win:SetConfig({},false)
+    win:GetGui().DisplayOrder=20
+    local function toggle(section,key,title)
+        app.controls[key]=section:Toggle(title,function(v)app:Set(key,v)end,C[key])
+    end
+    app.customControls={}
+    local function option(section,title,get,set)
+        local control=section:Toggle(title,set,get())
+        table.insert(app.customControls,{control=control,get=get})
+    end
+    local main=win:Folder("Players")
+    local quick=main:Section("ESP")
+    app.master=quick:Toggle("Enable ESP",function(on)app:Enable(on)end,false,Enum.KeyCode.F4)
+    quick:Label("F4 · ESP     RightShift · menu     End · stop all")
+    quick:Label("Unlimited range · choose what to display.")
+    toggle(quick,"showEnemies","Enemies")
+    toggle(quick,"showAllies","Teammates")
+    local visuals=main:Section("WHAT TO SHOW")
+    app.elementControls={}
+    local titles={Box="Boxes",["Name"]="Names",["Health"]="Health bars",["Distance"]="Distance",
+        Skeleton="Skeletons",Head="Head marker",Tracers="Tracers",["Arrows"]="Off-screen arrows",
+        Chams="Chams · body highlight",Radar="Radar",["Equipment"]="Equipment",Status="Visibility status"}
+    for _,name in ipairs({"Chams","Box","Name","Health","Distance","Skeleton","Head","Tracers","Arrows","Radar","Equipment","Status"}) do
+        app.elementControls[name]=visuals:Toggle(titles[name],function(on)
+            local list=table.clone(C.elements);local index=table.find(list,name)
+            if on and not index then table.insert(list,name) elseif not on and index then table.remove(list,index) end
+            app:Set("elements",list)
+        end,features[name]==true)
+    end
+    createObjectESP(app,C,win,overlay,highlights,{make=make,text=text,labelAt=labelAt,connect=connect,normalize=normalizeLegacy})
+    createSilentAim(app,win,overlay,{make=make,ally=ally,actorSource=SILENT_AIM_ACTOR_SOURCE})
+    local system=win:Folder("Settings")
+    local filters=system:Section("PLAYER FILTERS")
+    toggle(filters,"visibleOnly","Visible players only")
+    toggle(filters,"hideFriends","Hide friends")
+    toggle(filters,"hideProtected","Hide protected players")
+    toggle(filters,"hideViewSubject","Hide first-person spectated body")
+    local look=system:Section("PLAYER APPEARANCE")
+    option(look,"3D boxes",function()return C.box=="3D"end,function(on)app:Set("box",on and "3D" or "Corners")end)
+    option(look,"Filled boxes",function()return C.boxFill>0 end,function(on)app:Set("boxFill",on and 7 or 0)end)
+    option(look,"Chams through walls",function()return C.chamsMode=="Through walls"end,function(on)app:Set("chamsMode",on and "Through walls" or "Visible only")end)
+    option(look,"Filled chams",function()return C.chamsFill<100 end,function(on)app:Set("chamsFill",on and 85 or 100)end)
+    option(look,"Larger text",function()return C.textSize>=15 end,function(on)app:Set("textSize",on and 15 or 13)end)
+    toggle(look,"outline","Black outlines")
+    toggle(look,"visibilityColor","Color-code visibility")
+    toggle(look,"healthNumbers","Health numbers")
+    toggle(look,"arrowDistance","Arrow distances")
+    toggle(look,"radarRotate","Rotate radar with camera")
+    local performance=system:Section("DISPLAY OPTIONS")
+    toggle(performance,"objectDeclutter","Reduce object label overlap")
+    toggle(performance,"adaptive","Adaptive performance")
+    toggle(performance,"hud","Compact status HUD")
+    for _,p in ipairs(Players:GetPlayers()) do if p~=LocalPlayer then newEntry(p) end end
+    connect(Players.PlayerAdded,function(p)if app.alive and p~=LocalPlayer then newEntry(p) end end)
+    connect(Players.PlayerRemoving,function(p)
+        local e=app.entries[p];if e then destroyEntry(e);app.entries[p]=nil end
+    end)
+    connect(UIS.InputBegan,function(input,processed)
+        if processed or UIS:GetFocusedTextBox() then return end
+        if input.KeyCode==Enum.KeyCode.End then
+            app:Enable(false)
+            if app.silentAim then app.silentAim:Enable(false) end
+        end
+    end)
+    connect(RunService.RenderStepped,function(dt)
+        if app.silentAim then
+            local aimOk,aimError=pcall(app.silentAim.Update,app.silentAim,dt)
+            if not aimOk then app.silentAim.error=tostring(aimError);app.silentAim:Enable(false) end
+        end
+        local success,renderError=pcall(render,dt)
+        if not success then app.error=tostring(renderError);app:Enable(false);warn("[SmugESP] "..app.error) end
+    end)
+    app:Refresh()
+    app:Enable(false)
+    win:Notify("ESP ready · press F4 to enable",3)
+end,debug.traceback)
+if not ok then app.error=tostring(err);app:Unload();error("[SmugESP] "..tostring(err)) end
+return app
