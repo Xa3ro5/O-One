@@ -1,4 +1,4 @@
--- Operation One / Smug ESP | 2026-11-06.7
+-- Operation One / Smug ESP | 2026-11-06.8
 -- Load the shared SmugLibCoreV2 base and let it complete initialization.
 local function loadSmugLibrary()
     local url="https://raw.githubusercontent.com/Xa3ro5/LifeIsRoblox/refs/heads/main/SmugLibCoreV2.lua"
@@ -289,20 +289,76 @@ local function createObjectESP(app,C,win,overlay,highlightFolder,helpers)
     return object
 end
 
-local SILENT_AIM_ACTOR_SOURCE=[========[-- Operation One adapter: redirect only the native local Gun:send_shoot look.
--- Spread, range, ray_damage, ammunition and the native shoot event remain native.
+-- ForceFields are observed protection; spawn windows are explicitly estimates.
+local function createProtection()
+    local records=setmetatable({},{__mode="k"})
+    local modes={}
+    local ok,globals=pcall(function()return require(game.ReplicatedStorage.Modules.Globals)end)
+    if ok and type(globals)=="table" then modes=globals.gamemodes or {} end
+    local connection=workspace.ChildAdded:Connect(function(model)
+        if not model:IsA("Model") then return end
+        local mode=modes[workspace:GetAttribute("Gamemode")]
+        local duration=mode and mode.spawn_protection_seconds
+        if type(duration)=="number" and duration>0 then records[model]={deadline=os.clock()+duration} end
+    end)
+    local tracker={}
+    function tracker:Get(char)
+        if not char or not char.Parent then return false,nil,false end
+        local field=char:FindFirstChildOfClass("ForceField")
+        local record=records[char]
+        local remaining=record and math.max(0,record.deadline-os.clock()) or nil
+        if remaining and remaining>0 then return true,remaining,true end
+        -- An existing/permanent ForceField has no known expiry. Loading the
+        -- script never resets a countdown for a previously existing character.
+        return field~=nil,nil,false
+    end
+    function tracker:Unload()connection:Disconnect();table.clear(records)end
+    return tracker
+end
+
+local SILENT_AIM_ACTOR_SOURCE=[========[-- ForceFields are observed protection; spawn windows are explicitly estimates.
+local function createProtection()
+    local records=setmetatable({},{__mode="k"})
+    local modes={}
+    local ok,globals=pcall(function()return require(game.ReplicatedStorage.Modules.Globals)end)
+    if ok and type(globals)=="table" then modes=globals.gamemodes or {} end
+    local connection=workspace.ChildAdded:Connect(function(model)
+        if not model:IsA("Model") then return end
+        local mode=modes[workspace:GetAttribute("Gamemode")]
+        local duration=mode and mode.spawn_protection_seconds
+        if type(duration)=="number" and duration>0 then records[model]={deadline=os.clock()+duration} end
+    end)
+    local tracker={}
+    function tracker:Get(char)
+        if not char or not char.Parent then return false,nil,false end
+        local field=char:FindFirstChildOfClass("ForceField")
+        local record=records[char]
+        local remaining=record and math.max(0,record.deadline-os.clock()) or nil
+        if remaining and remaining>0 then return true,remaining,true end
+        -- An existing/permanent ForceField has no known expiry. Loading the
+        -- script never resets a countdown for a previously existing character.
+        return field~=nil,nil,false
+    end
+    function tracker:Unload()connection:Disconnect();table.clear(records)end
+    return tracker
+end
+
+-- Operation One adapter: redirect only the native local Gun:send_shoot look.
+-- Preserve native shots, ammunition, ray damage and replication.
 local function createSilentAim(app,win,overlay,helpers)
     local Players=game:GetService("Players")
     local UIS=game:GetService("UserInputService")
     local localPlayer=Players.LocalPlayer
     local make=helpers.make
-    local settings={fov=150,range=1000,chance=100,hitbox="Head",priority="Crosshair",
+    local settings={fov=150,chance=100,hitbox="Head",priority="Crosshair",
         visibleOnly=true,ignoreFriends=false,ignoreProtected=true,sticky=true,
-        holdRMB=false,adsOnly=false,showFov=true,showTarget=true}
+        holdRMB=false,adsOnly=false,showFov=true,showTarget=true,
+        noRecoil=false,noSpread=false,shotTrails=true}
     local aim={enabled=false,ready=false,settings=settings,target=nil,error=nil,
-        stats={shots=0,redirected=0,missedChance=0,candidates=0},generation=0}
+        stats={shots=0,completed=0,failed=0,rays=0,trails=0,lookCalls=0,scopedLooks=0,redirected=0,missedChance=0,candidates=0},generation=0}
     app.silentAim=aim
     local module,originalSend,originalLook,wrappedSend,wrappedLook
+    local originalRay,wrappedRay,originalKick,wrappedKick
     local bridge
     local scopes=setmetatable({},{__mode="k"})
     local params=RaycastParams.new()
@@ -337,6 +393,10 @@ local function createSilentAim(app,win,overlay,helpers)
             and not UIS:GetFocusedTextBox()
             and (not settings.holdRMB or UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton2))
     end
+    local function wanted()return aim.enabled or settings.noRecoil or settings.noSpread end
+    local function weaponActive()
+        return app.alive and aim.ready and wanted() and (not helpers.allowed or helpers.allowed())
+    end
     local function visible(origin,position,entry,localChar,camera)
         local ignore={camera}
         if localChar then table.insert(ignore,localChar) end
@@ -360,7 +420,8 @@ local function createSilentAim(app,win,overlay,helpers)
         if entry.player==localPlayer or entry.player.Parent~=Players or helpers.ally(entry.player)
             or not aliveCharacter(entry.char,entry.player) then return false end
         if settings.ignoreFriends and (entry.friend or entry.friendKnown==false) then return false end
-        if settings.ignoreProtected and entry.char:FindFirstChildOfClass("ForceField") then return false end
+        if settings.ignoreProtected and ((helpers.protection and helpers.protection(entry.char,entry.player))
+            or entry.char:FindFirstChildOfClass("ForceField")) then return false end
         -- A cached visual rig must still belong to the current live root.
         if not entry.root or not entry.root:IsDescendantOf(entry.char) then return false end
         if entry.rig~=entry.char then
@@ -370,7 +431,7 @@ local function createSilentAim(app,win,overlay,helpers)
         end
         return true
     end
-    local function selectTarget(origin,localChar,maxRange)
+    local function selectTarget(origin,localChar)
         local camera=workspace.CurrentCamera
         if not camera then return nil end
         local center=camera.ViewportSize*0.5
@@ -388,8 +449,7 @@ local function createSilentAim(app,win,overlay,helpers)
                         local projected,onScreen=camera:WorldToViewportPoint(position)
                         local pixel=(Vector2.new(projected.X,projected.Y)-center).Magnitude
                         local distance=(position-origin).Magnitude
-                        if onScreen and projected.Z>0 and pixel<=settings.fov and distance>0.01
-                            and distance<=math.min(settings.range,maxRange or 1000) then
+                        if onScreen and projected.Z>0 and pixel<=settings.fov and distance>0.01 then
                             local score=pixel/math.max(1,settings.fov)
                             if settings.priority=="Distance" then score=distance/1000
                             elseif settings.priority=="Health" then score=entry.hum.Health/math.max(1,entry.hum.MaxHealth)+score*0.001 end
@@ -413,12 +473,20 @@ local function createSilentAim(app,win,overlay,helpers)
         end
         return nil
     end
+    local function restoreScope(scope)
+        local weapon=scope.weapon
+        if scope.spreadProxy and weapon.states.spread==scope.spreadProxy then weapon.states.spread=scope.originalSpread end
+        if scope.recoilProxy and weapon.recoil==scope.recoilProxy then weapon.recoil=scope.originalRecoil end
+    end
     local function detach()
         -- Respect another script that replaced one of our methods after installation.
         if module then
             if module.send_shoot==wrappedSend then module.send_shoot=originalSend end
             if module.get_shoot_look==wrappedLook then module.get_shoot_look=originalLook end
+            if module.ray_damage==wrappedRay then module.ray_damage=originalRay end
+            if module.kickback==wrappedKick then module.kickback=originalKick end
         end
+        for _,scope in pairs(scopes) do restoreScope(scope) end
         table.clear(scopes)
         aim.ready=false
     end
@@ -442,25 +510,27 @@ local function createSilentAim(app,win,overlay,helpers)
         assert(actor and actor:IsA("Actor") and actor:FindFirstChild("Loader"),"Operation One's gameplay Actor is unavailable.")
         local id,event=create_comm_channel()
         local gate=Instance.new("BoolValue")
-        gate.Name="SilentAimEnabled";gate.Value=false;gate.Parent=overlay
+        -- Native input callbacks run at game identity. CoreGui/gethui descendants
+        -- throw capability errors there, even when only reading a BoolValue.
+        gate.Name="SmugSilentAimEnabled";gate.Value=false;gate.Parent=scripts
         local state={event=event,gate=gate,lastMessage=os.clock(),heartbeat=0,revision=1}
         bridge=state
         state.connection=event.Event:Connect(function(kind,data,revision)
             if bridge~=state or generation~=aim.generation or not app.alive then return end
             if kind=="booted" then
-                event:Fire("settings",table.clone(settings),state.revision)
+                event:Fire("settings",{settings=table.clone(settings),enabled=aim.enabled},state.revision)
             elseif kind=="ready" or kind=="snapshot" then
                 state.lastMessage=os.clock()
                 aim.stats=data.stats;aim.error=data.error;aim.ready=data.ready;aim.nativeWeapons=data.nativeWeapons
                 state.target=data
-                if data.error then aim:Enable(false);return end
-                if kind=="ready" and revision==state.revision then gate.Value=aim.enabled and data.ready end
+                if data.error then aim:StopAll();return end
+                if kind=="ready" and revision==state.revision then gate.Value=wanted() and data.ready end
             elseif kind=="error" then
-                aim.error=tostring(data);aim:Enable(false)
+                aim.error=tostring(data);aim:StopAll()
                 if app.window then app.window:Notify(aim.error,4) end
             end
         end)
-        aim.adapter="Actor";aim.enabled=true
+        aim.adapter="Actor"
         run_on_actor(actor,helpers.actorSource,id,gate)
     end
     local function attach()
@@ -476,46 +546,57 @@ local function createSilentAim(app,win,overlay,helpers)
         return loaded
     end
     function aim:Enable(on)
-        if on~=true then
-            self.enabled=false;self.generation+=1;self.target=nil
+        self.enabled=on==true
+        self.target=nil
+        if not wanted() then
+            self.generation+=1
             stopBridge();detach();ring.Visible=false;marker.Visible=false
             if self.control then self.control:Set(false,false) end
             return true
         end
         if not app.alive then return false end
-        if self.enabled and (self.ready or bridge) then return true end
+        if self.ready or bridge then
+            if bridge then
+                bridge.gate.Value=false;bridge.revision+=1
+                bridge.event:Fire("settings",{settings=table.clone(settings),enabled=self.enabled},bridge.revision)
+            end
+            if self.control then self.control:Set(self.enabled,false) end
+            return true
+        end
         self.generation+=1
         local generation=self.generation
         if helpers.actorSource and not helpers.nativeActor then
             self.error=nil
             local ok,err=pcall(startBridge,generation)
-            if not ok then self.error=tostring(err);self:Enable(false) end
+            if not ok then self.error=tostring(err);self:StopAll() end
             if self.control then self.control:Set(self.enabled,false) end
-            return ok and self.enabled
+            return ok
         end
         local ok,loaded=pcall(attach)
         if generation~=self.generation or not app.alive then return false end
         if not ok then
             self.error=tostring(loaded)
-            self:Enable(false)
+            self:StopAll()
             if app.window then app.window:Notify(self.error,4) end
             return false
         end
         module=loaded;originalSend=module.send_shoot;originalLook=module.get_shoot_look
-        local nativeSend,nativeLook=originalSend,originalLook
+        originalRay=module.ray_damage;originalKick=module.kickback
+        local nativeSend,nativeLook,nativeRay,nativeKick=originalSend,originalLook,originalRay,originalKick
         wrappedLook=function(weapon,...)
+            local scope=scopes[weapon]
             local base=nativeLook(weapon,...)
-            local scope=scopes[coroutine.running()]
+            self.stats.lookCalls+=1
             if generation~=self.generation or not scope or scope.weapon~=weapon or not activeInput()
                 or not ownsWeapon(weapon) then return base end
-            if scope.decided then return scope.look or base end
+            self.stats.scopedLooks+=1
+            if scope.decided then return base end
             scope.decided=true
             local success,result=pcall(function()
                 if typeof(base)~="CFrame" then return nil end
                 if settings.adsOnly and (not weapon.states.sights or not weapon.states.sights:get()) then return nil end
                 if math.random()*100>=settings.chance then self.stats.missedChance+=1;return nil end
-                local pellets=weapon.states.pellets:get()
-                local target=selectTarget(base.Position,weapon.owner.instance,pellets>1 and 250 or 1000)
+                local target=selectTarget(base.Position,weapon.owner.instance)
                 self.target=target
                 if not target then return nil end
                 self.stats.redirected+=1
@@ -523,40 +604,78 @@ local function createSilentAim(app,win,overlay,helpers)
                 return CFrame.lookAt(base.Position,target.position,base.UpVector)
             end)
             if not success then
-                self.error=tostring(result);self:Enable(false)
+                self.error=tostring(result)
                 return base
             end
             scope.look=result
             return result or base
         end
         wrappedSend=function(weapon,...)
-            if generation~=self.generation or not self.enabled or not app.alive or not ownsWeapon(weapon) then return nativeSend(weapon,...) end
-            local thread=coroutine.running()
-            if scopes[thread] then return nativeSend(weapon,...) end
-            scopes[thread]={weapon=weapon,decided=false}
+            if generation~=self.generation or not weaponActive() or not ownsWeapon(weapon) then return nativeSend(weapon,...) end
+            if scopes[weapon] then return nativeSend(weapon,...) end
+            local scope={weapon=weapon,decided=false,trails={}}
+            scopes[weapon]=scope
             self.stats.shots+=1
+            local spread,recoil=weapon.states.spread,weapon.recoil
+            local zeroSpread,noRecoil
+            if settings.noSpread and spread then
+                zeroSpread=setmetatable({get=function()return 0 end},{__index=spread})
+                weapon.states.spread=zeroSpread
+                scope.spreadProxy=zeroSpread;scope.originalSpread=spread
+            end
+            if settings.noRecoil then
+                noRecoil=function()end;weapon.recoil=noRecoil
+                scope.recoilProxy=noRecoil;scope.originalRecoil=recoil
+            end
             local result=table.pack(pcall(nativeSend,weapon,...))
-            scopes[thread]=nil
-            if not result[1] then error(result[2],0) end
+            restoreScope(scope)
+            scopes[weapon]=nil
+            if not result[1] then
+                self.stats.failed+=1;self.error=tostring(result[2])
+                error(result[2],0)
+            end
+            self.stats.completed+=1
+            if settings.shotTrails and generation==self.generation and weaponActive() and type(weapon.trail)=="function" then
+                for _,trail in ipairs(scope.trails) do
+                    local ok=pcall(weapon.trail,weapon,trail.origin,trail.finish)
+                    if ok then self.stats.trails+=1 end
+                end
+            end
             return table.unpack(result,2,result.n)
         end
+        if type(nativeRay)=="function" then wrappedRay=function(weapon,origin,direction,...)
+            local results=nativeRay(weapon,origin,direction,...)
+            local scope=scopes[weapon]
+            if scope and scope.weapon==weapon then
+                self.stats.rays+=1
+                local last=type(results)=="table" and results[#results]
+                table.insert(scope.trails,{origin=origin,finish=last and last.Position or origin+direction})
+            end
+            return results
+        end end
+        if type(nativeKick)=="function" then wrappedKick=function(weapon,...)
+            if generation==self.generation and settings.noRecoil and weaponActive() and ownsWeapon(weapon) then return end
+            return nativeKick(weapon,...)
+        end end
         local installed,installError=pcall(function()
             module.get_shoot_look=wrappedLook
             module.send_shoot=wrappedSend
+            if wrappedRay then module.ray_damage=wrappedRay end
+            if wrappedKick then module.kickback=wrappedKick end
         end)
         if not installed then
-            self.error=tostring(installError);self:Enable(false);return false
+            self.error=tostring(installError);self:StopAll();return false
         end
-        self.error=nil;self.enabled=true;self.ready=true
+        self.error=nil;self.ready=true
         self.adapter="Direct"
-        if self.control then self.control:Set(true,false) end
+        if self.control then self.control:Set(self.enabled,false) end
         return true
     end
     function aim:Set(key,value)
         if not app.alive or settings[key]==nil then return false end
-        if key=="fov" or key=="range" or key=="chance" then
+        if key=="fov" or key=="chance" then
             if type(value)~="number" or value~=value or math.abs(value)==math.huge then return false end
-            local bounds={fov={30,600},range={10,1000},chance={0,100}}
+            local bounds={fov={30,600},chance={0,100}}
             value=math.clamp(value,bounds[key][1],bounds[key][2])
         elseif key=="hitbox" then
             if not table.find({"Head","Torso","Closest part"},value) then return false end
@@ -567,8 +686,9 @@ local function createSilentAim(app,win,overlay,helpers)
         if bridge then
             bridge.gate.Value=false
             bridge.revision+=1
-            bridge.event:Fire("settings",table.clone(settings),bridge.revision)
+            bridge.event:Fire("settings",{settings=table.clone(settings),enabled=self.enabled},bridge.revision)
         end
+        if key=="noRecoil" or key=="noSpread" then self:Enable(self.enabled) end
         local control=self.controls and self.controls[key]
         if control then control:Set(value,false) end
         return true
@@ -590,12 +710,12 @@ local function createSilentAim(app,win,overlay,helpers)
             if bridge.heartbeat>=0.5 then bridge.heartbeat=0;bridge.event:Fire("heartbeat") end
             if os.clock()-bridge.lastMessage>4 then
                 self.error="Gameplay Actor stopped responding. Toggle Silent Aim to reconnect."
-                self:Enable(false)
+                self:StopAll()
             end
         end
-        if self.enabled and not bridge and (module.send_shoot~=wrappedSend or module.get_shoot_look~=wrappedLook) then
+        if self.ready and not bridge and (module.send_shoot~=wrappedSend or module.get_shoot_look~=wrappedLook) then
             self.error="Native weapon methods changed; toggle Silent Aim to reconnect."
-            self:Enable(false)
+            self:StopAll()
         end
         local camera=workspace.CurrentCamera
         local active=camera and activeInput() and aliveCharacter(app.localCharacter,localPlayer)
@@ -619,7 +739,7 @@ local function createSilentAim(app,win,overlay,helpers)
                         end
                     end
                     self.target=selected
-                else self.target=selectTarget(camera.CFrame.Position,app.localCharacter,1000) end
+                else self.target=selectTarget(camera.CFrame.Position,app.localCharacter) end
             end
             if self.target and eligible(self.target.entry) and self.target.part.Parent then
                 local p,onScreen=camera:WorldToViewportPoint(self.target.part.Position)
@@ -632,38 +752,54 @@ local function createSilentAim(app,win,overlay,helpers)
             statusClock=0
             local state=not self.enabled and "Disabled" or not active and "Waiting for a live character / aim input" or "Searching inside FOV"
             if self.target then state="Target: @"..self.target.entry.player.Name.." · "..self.target.part.Name end
-            self.status:SetText(self.error or string.format("%s\n%d shots · %d redirected looks",state,self.stats.shots,self.stats.redirected))
+            self.status:SetText(self.error or string.format("%s\n%d completed · %d failed · %d redirected · %d trails",state,
+                self.stats.completed,self.stats.failed,self.stats.redirected,self.stats.trails))
+        end
+    end
+    function aim:StopAll()
+        settings.noRecoil=false;settings.noSpread=false
+        self:Enable(false)
+        for _,key in ipairs({"noRecoil","noSpread"}) do
+            if self.controls and self.controls[key] then self.controls[key]:Set(false,false) end
         end
     end
     function aim:Unload()
-        self:Enable(false)
+        self:StopAll()
         ring:Destroy();marker:Destroy()
     end
     local tab=win:Folder("Silent Aim")
+    local initialized=false
     local main=tab:Section("SILENT AIM")
-    aim.control=main:Toggle("Enable Silent Aim",function(on)aim:Enable(on)end,false)
+    aim.control=main:Toggle("Enable Silent Aim",function(on)if initialized then aim:Enable(on)end end,false)
     main:Label("Native gun shots only · camera stays under your control.")
     aim.status=main:Label("Disabled")
     aim.controls={}
     local function toggle(section,key,title)
-        aim.controls[key]=section:Toggle(title,function(v)aim:Set(key,v)end,settings[key])
+        aim.controls[key]=section:Toggle(title,function(v)if initialized then aim:Set(key,v)end end,settings[key])
     end
     toggle(main,"holdRMB","Only while holding right mouse")
     toggle(main,"adsOnly","Only while aiming down sights")
+    local weapons=win:Folder("Weapons"):Section("WEAPON CONTROL")
+    weapons:Label("Independent controls · Silent Aim can stay disabled.")
+    toggle(weapons,"noRecoil","No Recoil")
+    toggle(weapons,"noSpread","No Spread")
+    toggle(weapons,"shotTrails","Show native shot trails")
     local target=tab:Section("TARGET SELECTION")
     aim.controls.hitbox=target:Dropdown("Hitbox",{"Head","Torso","Closest part"},function(v)aim:Set("hitbox",v)end,settings.hitbox)
     aim.controls.priority=target:Dropdown("Priority",{"Crosshair","Distance","Health"},function(v)aim:Set("priority",v)end,settings.priority)
     aim.controls.fov=target:Slider("FOV radius (pixels)",30,600,settings.fov,function(v)aim:Set("fov",v)end,5)
-    aim.controls.range=target:Slider("Maximum range (studs)",10,1000,settings.range,function(v)aim:Set("range",v)end,10)
     aim.controls.chance=target:Slider("Redirect chance (%)",0,100,settings.chance,function(v)aim:Set("chance",v)end,1)
     toggle(target,"sticky","Prefer the current target")
     local filters=tab:Section("FILTERS & DISPLAY")
     filters:Label("Teammates and dead/stale characters are always excluded.")
     toggle(filters,"visibleOnly","Require a clear line of sight")
-    toggle(filters,"ignoreProtected","Ignore ForceField-protected players")
+    toggle(filters,"ignoreProtected","Ignore protected / safe-zone players")
     toggle(filters,"ignoreFriends","Ignore friends")
     toggle(filters,"showFov","Show FOV circle")
     toggle(filters,"showTarget","Show target marker")
+    aim.control:Set(false,false)
+    aim.controls.noRecoil:Set(false,false);aim.controls.noSpread:Set(false,false)
+    initialized=true
     return aim
 end
 
@@ -673,10 +809,12 @@ local channel=get_comm_channel(channelId)
 local stopped=false
 local connections={}
 local controller
+local protection
 local function stop()
     if stopped then return end
     stopped=true
     if controller then controller:Unload() end
+    if protection then protection:Unload() end
     for _,connection in ipairs(connections) do connection:Disconnect() end
     table.clear(connections)
 end
@@ -721,7 +859,9 @@ local success,startError=xpcall(function()
         controller.nativeWeapons=matches
         return gun
     end
+    protection=createProtection()
     controller=createSilentAim(app,window,{}, {make=make,ally=ally,nativeActor=true,resolveGun=resolveGun,
+        protection=function(char)return protection:Get(char)end,
         allowed=function()return not stopped and gate.Parent~=nil and gate.Value end})
     local function refresh()
         local rigs,owned={},{}
@@ -780,10 +920,10 @@ local success,startError=xpcall(function()
             elseif kind=="heartbeat" then lastHeartbeat=os.clock()
             elseif kind=="settings" then
                 lastHeartbeat=os.clock()
-                for key,value in pairs(data) do
+                for key,value in pairs(data.settings) do
                     if controller.settings[key]~=value then assert(controller:Set(key,value),"Invalid aim setting: "..tostring(key)) end
                 end
-                assert(controller:Enable(true),controller.error or "Could not attach native gun methods.")
+                assert(controller:Enable(data.enabled),controller.error or "Could not attach native gun methods.")
                 channel:Fire("ready",controller:Snapshot(),revision)
             end
         end)
@@ -810,19 +950,21 @@ end,debug.traceback)
 if not success then fail(startError) end
 ]========]
 -- Operation One adapter: redirect only the native local Gun:send_shoot look.
--- Spread, range, ray_damage, ammunition and the native shoot event remain native.
+-- Preserve native shots, ammunition, ray damage and replication.
 local function createSilentAim(app,win,overlay,helpers)
     local Players=game:GetService("Players")
     local UIS=game:GetService("UserInputService")
     local localPlayer=Players.LocalPlayer
     local make=helpers.make
-    local settings={fov=150,range=1000,chance=100,hitbox="Head",priority="Crosshair",
+    local settings={fov=150,chance=100,hitbox="Head",priority="Crosshair",
         visibleOnly=true,ignoreFriends=false,ignoreProtected=true,sticky=true,
-        holdRMB=false,adsOnly=false,showFov=true,showTarget=true}
+        holdRMB=false,adsOnly=false,showFov=true,showTarget=true,
+        noRecoil=false,noSpread=false,shotTrails=true}
     local aim={enabled=false,ready=false,settings=settings,target=nil,error=nil,
-        stats={shots=0,redirected=0,missedChance=0,candidates=0},generation=0}
+        stats={shots=0,completed=0,failed=0,rays=0,trails=0,lookCalls=0,scopedLooks=0,redirected=0,missedChance=0,candidates=0},generation=0}
     app.silentAim=aim
     local module,originalSend,originalLook,wrappedSend,wrappedLook
+    local originalRay,wrappedRay,originalKick,wrappedKick
     local bridge
     local scopes=setmetatable({},{__mode="k"})
     local params=RaycastParams.new()
@@ -857,6 +999,10 @@ local function createSilentAim(app,win,overlay,helpers)
             and not UIS:GetFocusedTextBox()
             and (not settings.holdRMB or UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton2))
     end
+    local function wanted()return aim.enabled or settings.noRecoil or settings.noSpread end
+    local function weaponActive()
+        return app.alive and aim.ready and wanted() and (not helpers.allowed or helpers.allowed())
+    end
     local function visible(origin,position,entry,localChar,camera)
         local ignore={camera}
         if localChar then table.insert(ignore,localChar) end
@@ -880,7 +1026,8 @@ local function createSilentAim(app,win,overlay,helpers)
         if entry.player==localPlayer or entry.player.Parent~=Players or helpers.ally(entry.player)
             or not aliveCharacter(entry.char,entry.player) then return false end
         if settings.ignoreFriends and (entry.friend or entry.friendKnown==false) then return false end
-        if settings.ignoreProtected and entry.char:FindFirstChildOfClass("ForceField") then return false end
+        if settings.ignoreProtected and ((helpers.protection and helpers.protection(entry.char,entry.player))
+            or entry.char:FindFirstChildOfClass("ForceField")) then return false end
         -- A cached visual rig must still belong to the current live root.
         if not entry.root or not entry.root:IsDescendantOf(entry.char) then return false end
         if entry.rig~=entry.char then
@@ -890,7 +1037,7 @@ local function createSilentAim(app,win,overlay,helpers)
         end
         return true
     end
-    local function selectTarget(origin,localChar,maxRange)
+    local function selectTarget(origin,localChar)
         local camera=workspace.CurrentCamera
         if not camera then return nil end
         local center=camera.ViewportSize*0.5
@@ -908,8 +1055,7 @@ local function createSilentAim(app,win,overlay,helpers)
                         local projected,onScreen=camera:WorldToViewportPoint(position)
                         local pixel=(Vector2.new(projected.X,projected.Y)-center).Magnitude
                         local distance=(position-origin).Magnitude
-                        if onScreen and projected.Z>0 and pixel<=settings.fov and distance>0.01
-                            and distance<=math.min(settings.range,maxRange or 1000) then
+                        if onScreen and projected.Z>0 and pixel<=settings.fov and distance>0.01 then
                             local score=pixel/math.max(1,settings.fov)
                             if settings.priority=="Distance" then score=distance/1000
                             elseif settings.priority=="Health" then score=entry.hum.Health/math.max(1,entry.hum.MaxHealth)+score*0.001 end
@@ -933,12 +1079,20 @@ local function createSilentAim(app,win,overlay,helpers)
         end
         return nil
     end
+    local function restoreScope(scope)
+        local weapon=scope.weapon
+        if scope.spreadProxy and weapon.states.spread==scope.spreadProxy then weapon.states.spread=scope.originalSpread end
+        if scope.recoilProxy and weapon.recoil==scope.recoilProxy then weapon.recoil=scope.originalRecoil end
+    end
     local function detach()
         -- Respect another script that replaced one of our methods after installation.
         if module then
             if module.send_shoot==wrappedSend then module.send_shoot=originalSend end
             if module.get_shoot_look==wrappedLook then module.get_shoot_look=originalLook end
+            if module.ray_damage==wrappedRay then module.ray_damage=originalRay end
+            if module.kickback==wrappedKick then module.kickback=originalKick end
         end
+        for _,scope in pairs(scopes) do restoreScope(scope) end
         table.clear(scopes)
         aim.ready=false
     end
@@ -962,25 +1116,27 @@ local function createSilentAim(app,win,overlay,helpers)
         assert(actor and actor:IsA("Actor") and actor:FindFirstChild("Loader"),"Operation One's gameplay Actor is unavailable.")
         local id,event=create_comm_channel()
         local gate=Instance.new("BoolValue")
-        gate.Name="SilentAimEnabled";gate.Value=false;gate.Parent=overlay
+        -- Native input callbacks run at game identity. CoreGui/gethui descendants
+        -- throw capability errors there, even when only reading a BoolValue.
+        gate.Name="SmugSilentAimEnabled";gate.Value=false;gate.Parent=scripts
         local state={event=event,gate=gate,lastMessage=os.clock(),heartbeat=0,revision=1}
         bridge=state
         state.connection=event.Event:Connect(function(kind,data,revision)
             if bridge~=state or generation~=aim.generation or not app.alive then return end
             if kind=="booted" then
-                event:Fire("settings",table.clone(settings),state.revision)
+                event:Fire("settings",{settings=table.clone(settings),enabled=aim.enabled},state.revision)
             elseif kind=="ready" or kind=="snapshot" then
                 state.lastMessage=os.clock()
                 aim.stats=data.stats;aim.error=data.error;aim.ready=data.ready;aim.nativeWeapons=data.nativeWeapons
                 state.target=data
-                if data.error then aim:Enable(false);return end
-                if kind=="ready" and revision==state.revision then gate.Value=aim.enabled and data.ready end
+                if data.error then aim:StopAll();return end
+                if kind=="ready" and revision==state.revision then gate.Value=wanted() and data.ready end
             elseif kind=="error" then
-                aim.error=tostring(data);aim:Enable(false)
+                aim.error=tostring(data);aim:StopAll()
                 if app.window then app.window:Notify(aim.error,4) end
             end
         end)
-        aim.adapter="Actor";aim.enabled=true
+        aim.adapter="Actor"
         run_on_actor(actor,helpers.actorSource,id,gate)
     end
     local function attach()
@@ -996,46 +1152,57 @@ local function createSilentAim(app,win,overlay,helpers)
         return loaded
     end
     function aim:Enable(on)
-        if on~=true then
-            self.enabled=false;self.generation+=1;self.target=nil
+        self.enabled=on==true
+        self.target=nil
+        if not wanted() then
+            self.generation+=1
             stopBridge();detach();ring.Visible=false;marker.Visible=false
             if self.control then self.control:Set(false,false) end
             return true
         end
         if not app.alive then return false end
-        if self.enabled and (self.ready or bridge) then return true end
+        if self.ready or bridge then
+            if bridge then
+                bridge.gate.Value=false;bridge.revision+=1
+                bridge.event:Fire("settings",{settings=table.clone(settings),enabled=self.enabled},bridge.revision)
+            end
+            if self.control then self.control:Set(self.enabled,false) end
+            return true
+        end
         self.generation+=1
         local generation=self.generation
         if helpers.actorSource and not helpers.nativeActor then
             self.error=nil
             local ok,err=pcall(startBridge,generation)
-            if not ok then self.error=tostring(err);self:Enable(false) end
+            if not ok then self.error=tostring(err);self:StopAll() end
             if self.control then self.control:Set(self.enabled,false) end
-            return ok and self.enabled
+            return ok
         end
         local ok,loaded=pcall(attach)
         if generation~=self.generation or not app.alive then return false end
         if not ok then
             self.error=tostring(loaded)
-            self:Enable(false)
+            self:StopAll()
             if app.window then app.window:Notify(self.error,4) end
             return false
         end
         module=loaded;originalSend=module.send_shoot;originalLook=module.get_shoot_look
-        local nativeSend,nativeLook=originalSend,originalLook
+        originalRay=module.ray_damage;originalKick=module.kickback
+        local nativeSend,nativeLook,nativeRay,nativeKick=originalSend,originalLook,originalRay,originalKick
         wrappedLook=function(weapon,...)
+            local scope=scopes[weapon]
             local base=nativeLook(weapon,...)
-            local scope=scopes[coroutine.running()]
+            self.stats.lookCalls+=1
             if generation~=self.generation or not scope or scope.weapon~=weapon or not activeInput()
                 or not ownsWeapon(weapon) then return base end
-            if scope.decided then return scope.look or base end
+            self.stats.scopedLooks+=1
+            if scope.decided then return base end
             scope.decided=true
             local success,result=pcall(function()
                 if typeof(base)~="CFrame" then return nil end
                 if settings.adsOnly and (not weapon.states.sights or not weapon.states.sights:get()) then return nil end
                 if math.random()*100>=settings.chance then self.stats.missedChance+=1;return nil end
-                local pellets=weapon.states.pellets:get()
-                local target=selectTarget(base.Position,weapon.owner.instance,pellets>1 and 250 or 1000)
+                local target=selectTarget(base.Position,weapon.owner.instance)
                 self.target=target
                 if not target then return nil end
                 self.stats.redirected+=1
@@ -1043,40 +1210,78 @@ local function createSilentAim(app,win,overlay,helpers)
                 return CFrame.lookAt(base.Position,target.position,base.UpVector)
             end)
             if not success then
-                self.error=tostring(result);self:Enable(false)
+                self.error=tostring(result)
                 return base
             end
             scope.look=result
             return result or base
         end
         wrappedSend=function(weapon,...)
-            if generation~=self.generation or not self.enabled or not app.alive or not ownsWeapon(weapon) then return nativeSend(weapon,...) end
-            local thread=coroutine.running()
-            if scopes[thread] then return nativeSend(weapon,...) end
-            scopes[thread]={weapon=weapon,decided=false}
+            if generation~=self.generation or not weaponActive() or not ownsWeapon(weapon) then return nativeSend(weapon,...) end
+            if scopes[weapon] then return nativeSend(weapon,...) end
+            local scope={weapon=weapon,decided=false,trails={}}
+            scopes[weapon]=scope
             self.stats.shots+=1
+            local spread,recoil=weapon.states.spread,weapon.recoil
+            local zeroSpread,noRecoil
+            if settings.noSpread and spread then
+                zeroSpread=setmetatable({get=function()return 0 end},{__index=spread})
+                weapon.states.spread=zeroSpread
+                scope.spreadProxy=zeroSpread;scope.originalSpread=spread
+            end
+            if settings.noRecoil then
+                noRecoil=function()end;weapon.recoil=noRecoil
+                scope.recoilProxy=noRecoil;scope.originalRecoil=recoil
+            end
             local result=table.pack(pcall(nativeSend,weapon,...))
-            scopes[thread]=nil
-            if not result[1] then error(result[2],0) end
+            restoreScope(scope)
+            scopes[weapon]=nil
+            if not result[1] then
+                self.stats.failed+=1;self.error=tostring(result[2])
+                error(result[2],0)
+            end
+            self.stats.completed+=1
+            if settings.shotTrails and generation==self.generation and weaponActive() and type(weapon.trail)=="function" then
+                for _,trail in ipairs(scope.trails) do
+                    local ok=pcall(weapon.trail,weapon,trail.origin,trail.finish)
+                    if ok then self.stats.trails+=1 end
+                end
+            end
             return table.unpack(result,2,result.n)
         end
+        if type(nativeRay)=="function" then wrappedRay=function(weapon,origin,direction,...)
+            local results=nativeRay(weapon,origin,direction,...)
+            local scope=scopes[weapon]
+            if scope and scope.weapon==weapon then
+                self.stats.rays+=1
+                local last=type(results)=="table" and results[#results]
+                table.insert(scope.trails,{origin=origin,finish=last and last.Position or origin+direction})
+            end
+            return results
+        end end
+        if type(nativeKick)=="function" then wrappedKick=function(weapon,...)
+            if generation==self.generation and settings.noRecoil and weaponActive() and ownsWeapon(weapon) then return end
+            return nativeKick(weapon,...)
+        end end
         local installed,installError=pcall(function()
             module.get_shoot_look=wrappedLook
             module.send_shoot=wrappedSend
+            if wrappedRay then module.ray_damage=wrappedRay end
+            if wrappedKick then module.kickback=wrappedKick end
         end)
         if not installed then
-            self.error=tostring(installError);self:Enable(false);return false
+            self.error=tostring(installError);self:StopAll();return false
         end
-        self.error=nil;self.enabled=true;self.ready=true
+        self.error=nil;self.ready=true
         self.adapter="Direct"
-        if self.control then self.control:Set(true,false) end
+        if self.control then self.control:Set(self.enabled,false) end
         return true
     end
     function aim:Set(key,value)
         if not app.alive or settings[key]==nil then return false end
-        if key=="fov" or key=="range" or key=="chance" then
+        if key=="fov" or key=="chance" then
             if type(value)~="number" or value~=value or math.abs(value)==math.huge then return false end
-            local bounds={fov={30,600},range={10,1000},chance={0,100}}
+            local bounds={fov={30,600},chance={0,100}}
             value=math.clamp(value,bounds[key][1],bounds[key][2])
         elseif key=="hitbox" then
             if not table.find({"Head","Torso","Closest part"},value) then return false end
@@ -1087,8 +1292,9 @@ local function createSilentAim(app,win,overlay,helpers)
         if bridge then
             bridge.gate.Value=false
             bridge.revision+=1
-            bridge.event:Fire("settings",table.clone(settings),bridge.revision)
+            bridge.event:Fire("settings",{settings=table.clone(settings),enabled=self.enabled},bridge.revision)
         end
+        if key=="noRecoil" or key=="noSpread" then self:Enable(self.enabled) end
         local control=self.controls and self.controls[key]
         if control then control:Set(value,false) end
         return true
@@ -1110,12 +1316,12 @@ local function createSilentAim(app,win,overlay,helpers)
             if bridge.heartbeat>=0.5 then bridge.heartbeat=0;bridge.event:Fire("heartbeat") end
             if os.clock()-bridge.lastMessage>4 then
                 self.error="Gameplay Actor stopped responding. Toggle Silent Aim to reconnect."
-                self:Enable(false)
+                self:StopAll()
             end
         end
-        if self.enabled and not bridge and (module.send_shoot~=wrappedSend or module.get_shoot_look~=wrappedLook) then
+        if self.ready and not bridge and (module.send_shoot~=wrappedSend or module.get_shoot_look~=wrappedLook) then
             self.error="Native weapon methods changed; toggle Silent Aim to reconnect."
-            self:Enable(false)
+            self:StopAll()
         end
         local camera=workspace.CurrentCamera
         local active=camera and activeInput() and aliveCharacter(app.localCharacter,localPlayer)
@@ -1139,7 +1345,7 @@ local function createSilentAim(app,win,overlay,helpers)
                         end
                     end
                     self.target=selected
-                else self.target=selectTarget(camera.CFrame.Position,app.localCharacter,1000) end
+                else self.target=selectTarget(camera.CFrame.Position,app.localCharacter) end
             end
             if self.target and eligible(self.target.entry) and self.target.part.Parent then
                 local p,onScreen=camera:WorldToViewportPoint(self.target.part.Position)
@@ -1152,38 +1358,54 @@ local function createSilentAim(app,win,overlay,helpers)
             statusClock=0
             local state=not self.enabled and "Disabled" or not active and "Waiting for a live character / aim input" or "Searching inside FOV"
             if self.target then state="Target: @"..self.target.entry.player.Name.." · "..self.target.part.Name end
-            self.status:SetText(self.error or string.format("%s\n%d shots · %d redirected looks",state,self.stats.shots,self.stats.redirected))
+            self.status:SetText(self.error or string.format("%s\n%d completed · %d failed · %d redirected · %d trails",state,
+                self.stats.completed,self.stats.failed,self.stats.redirected,self.stats.trails))
+        end
+    end
+    function aim:StopAll()
+        settings.noRecoil=false;settings.noSpread=false
+        self:Enable(false)
+        for _,key in ipairs({"noRecoil","noSpread"}) do
+            if self.controls and self.controls[key] then self.controls[key]:Set(false,false) end
         end
     end
     function aim:Unload()
-        self:Enable(false)
+        self:StopAll()
         ring:Destroy();marker:Destroy()
     end
     local tab=win:Folder("Silent Aim")
+    local initialized=false
     local main=tab:Section("SILENT AIM")
-    aim.control=main:Toggle("Enable Silent Aim",function(on)aim:Enable(on)end,false)
+    aim.control=main:Toggle("Enable Silent Aim",function(on)if initialized then aim:Enable(on)end end,false)
     main:Label("Native gun shots only · camera stays under your control.")
     aim.status=main:Label("Disabled")
     aim.controls={}
     local function toggle(section,key,title)
-        aim.controls[key]=section:Toggle(title,function(v)aim:Set(key,v)end,settings[key])
+        aim.controls[key]=section:Toggle(title,function(v)if initialized then aim:Set(key,v)end end,settings[key])
     end
     toggle(main,"holdRMB","Only while holding right mouse")
     toggle(main,"adsOnly","Only while aiming down sights")
+    local weapons=win:Folder("Weapons"):Section("WEAPON CONTROL")
+    weapons:Label("Independent controls · Silent Aim can stay disabled.")
+    toggle(weapons,"noRecoil","No Recoil")
+    toggle(weapons,"noSpread","No Spread")
+    toggle(weapons,"shotTrails","Show native shot trails")
     local target=tab:Section("TARGET SELECTION")
     aim.controls.hitbox=target:Dropdown("Hitbox",{"Head","Torso","Closest part"},function(v)aim:Set("hitbox",v)end,settings.hitbox)
     aim.controls.priority=target:Dropdown("Priority",{"Crosshair","Distance","Health"},function(v)aim:Set("priority",v)end,settings.priority)
     aim.controls.fov=target:Slider("FOV radius (pixels)",30,600,settings.fov,function(v)aim:Set("fov",v)end,5)
-    aim.controls.range=target:Slider("Maximum range (studs)",10,1000,settings.range,function(v)aim:Set("range",v)end,10)
     aim.controls.chance=target:Slider("Redirect chance (%)",0,100,settings.chance,function(v)aim:Set("chance",v)end,1)
     toggle(target,"sticky","Prefer the current target")
     local filters=tab:Section("FILTERS & DISPLAY")
     filters:Label("Teammates and dead/stale characters are always excluded.")
     toggle(filters,"visibleOnly","Require a clear line of sight")
-    toggle(filters,"ignoreProtected","Ignore ForceField-protected players")
+    toggle(filters,"ignoreProtected","Ignore protected / safe-zone players")
     toggle(filters,"ignoreFriends","Ignore friends")
     toggle(filters,"showFov","Show FOV circle")
     toggle(filters,"showTarget","Show target marker")
+    aim.control:Set(false,false)
+    aim.controls.noRecoil:Set(false,false);aim.controls.noSpread:Set(false,false)
+    initialized=true
     return aim
 end
 
@@ -1201,8 +1423,9 @@ if old and type(old.Unload) == "function" then old:Unload() end
 local Library=loadSmugLibrary()
 assert(type(Library)=="table" and type(Library.CreateWindow)=="function","Failed to load SmugLib V2.")
 local app = {alive = true, enabled = false, entries = {}, objects = {}, connections = {}, controls = {},
-    stats = {drawn = 0, tracked = 0, rigs = 0, rays = 0, ms = 0}, version = "2026-11-06.7", error = nil}
+    stats = {drawn = 0, tracked = 0, rigs = 0, rays = 0, ms = 0}, version = "2026-11-06.8", error = nil}
 env.SmugESP = app
+app.protection=createProtection()
 local CONFIG_FILE = "SmugESP_OperationOne_v1.json"
 local defaults = {
     elements = {"Box", "Name", "Health", "Distance", "Arrows", "Chams"},
@@ -1212,6 +1435,7 @@ local defaults = {
     visibleOnly = false, hideFriends = false, hideProtected = false, hideViewSubject = true,
     visibleColor = "65E5B5", enemyColor = "FF6B7C", allyColor = "70B7FF", objectColor = "F6C76B",
     hiddenColor = "CB91ED", visibilityColor = true, tracerOrigin = "Bottom",
+    safeColor = "FFD54F", safeColors = true, safeCountdown = true,
     headScale = 5, chamsFill = 85, chamsOutline = 15,
     chamsMode = "Through walls", arrowRadius = 80, arrowSize = 11, arrowDistance = true,
     radarSize = 160, radarSide = "Left", radarRotate = true,
@@ -1406,7 +1630,7 @@ local function newEntry(player)
     local e={player=player, frame=make("Frame",{Name=tostring(player.UserId),BackgroundTransparency=1,
         Size=UDim2.fromScale(1,1),Visible=false},layer),lines={},lineIndex=0,visible=false,checked=0,
         parts={},rig=nil,char=nil,root=nil,hum=nil,friend=false,friendKnown=false,labels={}}
-    for _,name in ipairs({"name","info","detail","hp","arrow"}) do e.labels[name]=text(e.frame,C.textSize) end
+    for _,name in ipairs({"name","info","detail","hp","arrow","safe"}) do e.labels[name]=text(e.frame,C.textSize) end
     e.fill=make("Frame",{Name="BoxFill",BorderSizePixel=0,BackgroundTransparency=1,Visible=false,ZIndex=1},e.frame)
     e.healthBG=make("Frame",{BorderSizePixel=0,BackgroundColor3=Color3.fromRGB(8,10,14),Visible=false,ZIndex=3},e.frame)
     e.healthFill=make("Frame",{BorderSizePixel=0,ZIndex=4},e.healthBG)
@@ -1458,6 +1682,7 @@ function app:Unload()
     if not self.alive then return end
     self.alive=false;self.enabled=false
     if self.silentAim then self.silentAim:Unload() end
+    if self.protection then self.protection:Unload() end
     for _,c in ipairs(self.connections) do c:Disconnect() end
     table.clear(self.connections)
     if self.window then self.window:Kill() end
@@ -1587,6 +1812,7 @@ local function updateVisibility(camera,now)
     end
 end
 local function colorFor(e,distance,health)
+    if C.safeColors and e.protected then return colors.safeColor end
     if C.colorMode=="Health" then return Color3.fromRGB(255,92,104):Lerp(Color3.fromRGB(101,229,181),health) end
     if C.colorMode=="Distance" then return colors.enemyColor:Lerp(colors.allyColor,distance/(distance+300)) end
     if C.colorMode=="Team" and e.player.Team then return e.player.Team.TeamColor.Color end
@@ -1723,7 +1949,8 @@ local function eligible(e,camera,now)
         and (e.headPart.Position-camera.CFrame.Position).Magnitude<3 then return nil end
     if e.allied and not C.showAllies or not e.allied and not C.showEnemies then return nil end
     if C.hideFriends and e.friend then return nil end
-    if C.hideProtected and e.char:FindFirstChildOfClass("ForceField") then return nil end
+    e.protected,e.safeRemaining,e.safeEstimated=app.protection:Get(e.char)
+    if C.hideProtected and e.protected then return nil end
     local distance=(e.root.Position-camera.CFrame.Position).Magnitude
     if C.visibleOnly and (not e.visible or now-e.checked>math.max(0.5,app.stats.tracked/C.rayBudget/C.rayRate*2)) then return nil end
     return distance
@@ -1740,6 +1967,12 @@ local function drawPlayer(e,camera,viewport,distance,allowChams)
     local boxOnScreen=x0 and x1>0 and x0<viewport.X and y1>0 and y0<viewport.Y
     if boxOnScreen then
         local cx=(x0+x1)*0.5
+        if C.safeCountdown and e.protected then
+            local caption=e.safeRemaining and string.format("SAFE ~%.1fs",e.safeRemaining) or "SAFE"
+            labelAt(e.labels.safe,caption,cx,y0-C.textSize*2.7-12,colors.safeColor,alpha,240)
+            e.labels.safe.TextSize=24
+            e.labels.safe.Size=UDim2.fromOffset(240,32)
+        end
         if features.Box then drawBox(e,x0,y0,x1,y1,points,color,alpha) end
         if features["Name"] then
             local name=e.player.DisplayName
@@ -1888,7 +2121,8 @@ local ok,err=xpcall(function()
         end,features[name]==true)
     end
     createObjectESP(app,C,win,overlay,highlights,{make=make,text=text,labelAt=labelAt,connect=connect,normalize=normalizeLegacy})
-    createSilentAim(app,win,overlay,{make=make,ally=ally,actorSource=SILENT_AIM_ACTOR_SOURCE})
+    createSilentAim(app,win,overlay,{make=make,ally=ally,actorSource=SILENT_AIM_ACTOR_SOURCE,
+        protection=function(char)return app.protection:Get(char)end})
     local system=win:Folder("Settings")
     local filters=system:Section("PLAYER FILTERS")
     toggle(filters,"visibleOnly","Visible players only")
@@ -1903,6 +2137,9 @@ local ok,err=xpcall(function()
     option(look,"Larger text",function()return C.textSize>=15 end,function(on)app:Set("textSize",on and 15 or 13)end)
     toggle(look,"outline","Black outlines")
     toggle(look,"visibilityColor","Color-code visibility")
+    toggle(look,"safeColors","Yellow protected players")
+    toggle(look,"safeCountdown","Large protection countdown")
+    look:Label("SAFE ~seconds estimates newly observed spawn protection; SAFE alone has no known expiry.")
     toggle(look,"healthNumbers","Health numbers")
     toggle(look,"arrowDistance","Arrow distances")
     toggle(look,"radarRotate","Rotate radar with camera")
@@ -1919,13 +2156,13 @@ local ok,err=xpcall(function()
         if processed or UIS:GetFocusedTextBox() then return end
         if input.KeyCode==Enum.KeyCode.End then
             app:Enable(false)
-            if app.silentAim then app.silentAim:Enable(false) end
+            if app.silentAim then app.silentAim:StopAll() end
         end
     end)
     connect(RunService.RenderStepped,function(dt)
         if app.silentAim then
             local aimOk,aimError=pcall(app.silentAim.Update,app.silentAim,dt)
-            if not aimOk then app.silentAim.error=tostring(aimError);app.silentAim:Enable(false) end
+            if not aimOk then app.silentAim.error=tostring(aimError);app.silentAim:StopAll() end
         end
         local success,renderError=pcall(render,dt)
         if not success then app.error=tostring(renderError);app:Enable(false);warn("[SmugESP] "..app.error) end
