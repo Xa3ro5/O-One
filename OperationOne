@@ -1,4 +1,4 @@
--- Operation One / Smug ESP | 2026-11-06.8
+-- Operation One / Smug ESP | 2026-11-11.1
 -- Load the shared SmugLibCoreV2 base and let it complete initialization.
 local function loadSmugLibrary()
     local url="https://raw.githubusercontent.com/Xa3ro5/LifeIsRoblox/refs/heads/main/SmugLibCoreV2.lua"
@@ -8,6 +8,126 @@ local function loadSmugLibrary()
     local factory,compileError=loadstring(source)
     assert(factory,compileError or "Failed to compile SmugLib V2.")
     return factory()
+end
+
+-- One versioned snapshot owns persistence; UI-library config never starts features.
+local function createConfigStore(app, http, env, capture, apply, io)
+    io=io or {read=readfile,write=writefile,exists=isfile,delay=task.delay}
+    local store={path="SmugESP_OperationOne_v2.json",legacyPath="SmugESP_OperationOne_v1.json",
+        ready=false,applying=false,dirty=false,revision=0,status="Initializing configuration"}
+    local cacheKey="SmugESP_OperationOne_ConfigV2"
+    local lastGood
+    local function clone(value)return http:JSONDecode(http:JSONEncode(value))end
+    function store:Status(message)
+        self.status=message
+        if self.label then self.label:SetText(message) end
+    end
+    local function decode(raw)
+        local data=http:JSONDecode(raw)
+        assert(type(data)=="table" and data.schema==2 and data.game=="OperationOne"
+            and type(data.esp)=="table" and type(data.aim)=="table"
+            and type(data.aim.settings)=="table" and type(data.enabled)=="boolean"
+            and type(data.aim.enabled)=="boolean","Invalid or unsupported configuration")
+        return data
+    end
+    local function read(path,legacy)
+        if type(io.exists)=="function" and not io.exists(path) then return nil end
+        local raw=io.read(path)
+        if legacy then
+            local data=http:JSONDecode(raw)
+            assert(type(data)=="table","Invalid legacy configuration")
+            return {schema=2,game="OperationOne",esp=data,enabled=false,
+                aim={settings={},enabled=false},legacy=true}
+        end
+        return decode(raw),raw
+    end
+    function store:Read()
+        if type(io.read)~="function" then
+            if env[cacheKey] then return clone(env[cacheKey]),"Loaded session configuration" end
+            return nil,"File reading unavailable; session configuration only"
+        end
+        local ok,data,raw=pcall(read,self.path)
+        if ok and data then self.blocked=false;lastGood=raw;return data,"Loaded saved configuration" end
+        if not ok then
+            self.blocked=true
+            local backupOK,backup,backupRaw=pcall(read,self.path..".bak")
+            if backupOK and backup then
+                lastGood=backupRaw
+                return backup,"Recovered backup; use Save to repair the main file"
+            end
+            return nil,"Cannot read configuration; original kept. Use Save to replace it."
+        end
+        local legacyOK,legacy=pcall(read,self.legacyPath,true)
+        if legacyOK and legacy then return legacy,"Imported legacy ESP configuration" end
+        if not legacyOK then
+            self.blocked=true
+            return nil,"Cannot read legacy configuration; use Save to create a new one"
+        end
+        if env[cacheKey] then return clone(env[cacheKey]),"Loaded session configuration" end
+        return nil,"No saved configuration yet; changes save automatically"
+    end
+    function store:Save(explicit)
+        if not self.ready or self.applying then return false end
+        if self.blocked and not explicit then return false end
+        local ok,result=pcall(function()
+            local data=capture()
+            local raw=http:JSONEncode(data)
+            decode(raw)
+            env[cacheKey]=clone(data)
+            if type(io.write)~="function" then
+                self:Status("Saved for this session only; writefile unavailable")
+                return false
+            end
+            -- Back up the last decoded snapshot, never a corrupt or partial file.
+            if lastGood then io.write(self.path..".bak",lastGood) end
+            io.write(self.path,raw)
+            if type(io.read)=="function" then
+                assert(io.read(self.path)==raw,"Configuration write verification failed")
+            end
+            lastGood=raw;self.blocked=false
+            self:Status(type(io.read)=="function" and "Saved · automatic restore on next run"
+                or "Saved to disk; readfile unavailable, restore is session-only")
+            return true
+        end)
+        if not ok then self:Status("Save failed: "..tostring(result));return false end
+        self.dirty=false
+        return result
+    end
+    function store:Changed()
+        if not self.ready or self.applying or not app.alive then return end
+        env[cacheKey]=clone(capture())
+        self.dirty=true;self.revision+=1
+        local revision=self.revision
+        io.delay(0.5,function()
+            if app.alive and self.ready and self.revision==revision and self.dirty then self:Save(false) end
+        end)
+    end
+    function store:Apply(data)
+        self.revision+=1
+        self.applying=true
+        local ok,err=pcall(apply,data)
+        self.applying=false
+        if not ok then self:Status("Load failed: "..tostring(err));return false end
+        self.dirty=false
+        env[cacheKey]=clone(capture())
+        return true
+    end
+    function store:Load()
+        local data,message=self:Read()
+        if data and not self:Apply(data) then return false end
+        self:Status(message)
+        if data and data.legacy and self.ready then self:Changed() end
+        return data~=nil
+    end
+    function store:Reset()
+        if not self:Apply({esp={},aim={settings={},enabled=false},enabled=false}) then return false end
+        return self:Save(true)
+    end
+    function store:Close()
+        if self.ready then self:Save(false) end
+        self.ready=false;self.revision+=1
+    end
+    return store
 end
 
 -- Read-only CollectionService registry; GUI and adornments are the only owned instances.
@@ -207,15 +327,24 @@ local function createObjectESP(app,C,win,overlay,highlightFolder,helpers)
     end
     local controls={}
     app.objectCategoryControls={}
-    -- Old per-type switches must not contradict the new category switches.
-    for tag in pairs(types) do
-        if rules[tag] then
-            for _,key in ipairs({"enabled","chams","labels","showDistance","showHealth","showOwner","hideDestroyed","filter","depth","fill","outline"}) do rules[tag][key]=nil end
-        end
-    end
-    for _,category in ipairs(categoryOrder) do rules["@"..category].filter="All" end
     local function sync()
         for _,binding in ipairs(controls) do binding.control:Set(binding.get()) end
+    end
+    function object:ApplySettings(values,legacy)
+        raw=type(values)=="table" and values or {}
+        table.clear(rules)
+        C.objectRules=rules
+        for _,category in ipairs(categoryOrder) do loadRule("@"..category,category) end
+        for tag in pairs(types) do
+            if raw[tag] then
+                local rule=loadRule(tag,lookup[tag],rules["@"..lookup[tag]])
+                if legacy then
+                    for _,key in ipairs({"enabled","chams","labels","showDistance","showHealth","showOwner","hideDestroyed","filter","depth","fill","outline"}) do rule[key]=nil end
+                end
+            end
+        end
+        if legacy then for _,category in ipairs(categoryOrder) do rules["@"..category].filter="All" end end
+        cacheClock=1;hideAll(true);sync()
     end
     function app:SetObjectRule(id,key,value)
         id=helpers.normalize(id)
@@ -227,7 +356,9 @@ local function createObjectESP(app,C,win,overlay,highlightFolder,helpers)
         if id:sub(1,1)=="@" then
             for _,tag in ipairs(categoryTypes[category]) do if rules[tag] then rules[tag][key]=nil end end
         end
-        cacheClock=1;sync();return true
+        cacheClock=1;sync()
+        if app.ConfigChanged then app:ConfigChanged() end
+        return true
     end
     function app:ObjectSnapshot()
         return {counts=table.clone(counts),shown=self.stats.objects or 0,candidates=self.stats.objectCandidates or 0,chams=self.stats.objectChams or 0}
@@ -238,6 +369,7 @@ local function createObjectESP(app,C,win,overlay,highlightFolder,helpers)
             for _,tag in ipairs(categoryTypes[category]) do rules[tag]=nil end
         end
         cacheClock=1;hideAll(true);sync()
+        if app.ConfigChanged then app:ConfigChanged() end
     end
     local function categoryToggle(section,category,key,title)
         local function get()return rules["@"..category][key]end
@@ -354,6 +486,7 @@ local function createSilentAim(app,win,overlay,helpers)
         visibleOnly=true,ignoreFriends=false,ignoreProtected=true,sticky=true,
         holdRMB=false,adsOnly=false,showFov=true,showTarget=true,
         noRecoil=false,noSpread=false,shotTrails=true}
+    local defaults=table.clone(settings)
     local aim={enabled=false,ready=false,settings=settings,target=nil,error=nil,
         stats={shots=0,completed=0,failed=0,rays=0,trails=0,lookCalls=0,scopedLooks=0,redirected=0,missedChance=0,candidates=0},generation=0}
     app.silentAim=aim
@@ -547,6 +680,7 @@ local function createSilentAim(app,win,overlay,helpers)
     end
     function aim:Enable(on)
         self.enabled=on==true
+        if app.ConfigChanged then app:ConfigChanged() end
         self.target=nil
         if not wanted() then
             self.generation+=1
@@ -671,17 +805,36 @@ local function createSilentAim(app,win,overlay,helpers)
         if self.control then self.control:Set(self.enabled,false) end
         return true
     end
-    function aim:Set(key,value)
-        if not app.alive or settings[key]==nil then return false end
+    local function validate(key,value)
+        if defaults[key]==nil then return nil end
         if key=="fov" or key=="chance" then
-            if type(value)~="number" or value~=value or math.abs(value)==math.huge then return false end
+            if type(value)~="number" or value~=value or math.abs(value)==math.huge then return nil end
             local bounds={fov={30,600},chance={0,100}}
             value=math.clamp(value,bounds[key][1],bounds[key][2])
         elseif key=="hitbox" then
-            if not table.find({"Head","Torso","Closest part"},value) then return false end
+            if not table.find({"Head","Torso","Closest part"},value) then return nil end
         elseif key=="priority" then
-            if not table.find({"Crosshair","Distance","Health"},value) then return false end
-        elseif type(value)~="boolean" then return false end
+            if not table.find({"Crosshair","Distance","Health"},value) then return nil end
+        elseif type(value)~="boolean" then return nil end
+        return value
+    end
+    function aim:ApplySettings(values,enabled)
+        -- Replace every preference before attaching or updating the gameplay Actor.
+        for key,default in pairs(defaults) do
+            local value
+            if type(values)=="table" then value=validate(key,values[key]) end
+            if value==nil then value=default end
+            settings[key]=value
+            local control=self.controls and self.controls[key]
+            if control then control:Set(value,false) end
+        end
+        self.error=nil
+        return self:Enable(enabled)
+    end
+    function aim:Set(key,value)
+        if not app.alive then return false end
+        value=validate(key,value)
+        if value==nil then return false end
         settings[key]=value;self.target=nil
         if bridge then
             bridge.gate.Value=false
@@ -691,6 +844,7 @@ local function createSilentAim(app,win,overlay,helpers)
         if key=="noRecoil" or key=="noSpread" then self:Enable(self.enabled) end
         local control=self.controls and self.controls[key]
         if control then control:Set(value,false) end
+        if app.ConfigChanged then app:ConfigChanged() end
         return true
     end
     function aim:Snapshot()
@@ -960,6 +1114,7 @@ local function createSilentAim(app,win,overlay,helpers)
         visibleOnly=true,ignoreFriends=false,ignoreProtected=true,sticky=true,
         holdRMB=false,adsOnly=false,showFov=true,showTarget=true,
         noRecoil=false,noSpread=false,shotTrails=true}
+    local defaults=table.clone(settings)
     local aim={enabled=false,ready=false,settings=settings,target=nil,error=nil,
         stats={shots=0,completed=0,failed=0,rays=0,trails=0,lookCalls=0,scopedLooks=0,redirected=0,missedChance=0,candidates=0},generation=0}
     app.silentAim=aim
@@ -1153,6 +1308,7 @@ local function createSilentAim(app,win,overlay,helpers)
     end
     function aim:Enable(on)
         self.enabled=on==true
+        if app.ConfigChanged then app:ConfigChanged() end
         self.target=nil
         if not wanted() then
             self.generation+=1
@@ -1277,17 +1433,36 @@ local function createSilentAim(app,win,overlay,helpers)
         if self.control then self.control:Set(self.enabled,false) end
         return true
     end
-    function aim:Set(key,value)
-        if not app.alive or settings[key]==nil then return false end
+    local function validate(key,value)
+        if defaults[key]==nil then return nil end
         if key=="fov" or key=="chance" then
-            if type(value)~="number" or value~=value or math.abs(value)==math.huge then return false end
+            if type(value)~="number" or value~=value or math.abs(value)==math.huge then return nil end
             local bounds={fov={30,600},chance={0,100}}
             value=math.clamp(value,bounds[key][1],bounds[key][2])
         elseif key=="hitbox" then
-            if not table.find({"Head","Torso","Closest part"},value) then return false end
+            if not table.find({"Head","Torso","Closest part"},value) then return nil end
         elseif key=="priority" then
-            if not table.find({"Crosshair","Distance","Health"},value) then return false end
-        elseif type(value)~="boolean" then return false end
+            if not table.find({"Crosshair","Distance","Health"},value) then return nil end
+        elseif type(value)~="boolean" then return nil end
+        return value
+    end
+    function aim:ApplySettings(values,enabled)
+        -- Replace every preference before attaching or updating the gameplay Actor.
+        for key,default in pairs(defaults) do
+            local value
+            if type(values)=="table" then value=validate(key,values[key]) end
+            if value==nil then value=default end
+            settings[key]=value
+            local control=self.controls and self.controls[key]
+            if control then control:Set(value,false) end
+        end
+        self.error=nil
+        return self:Enable(enabled)
+    end
+    function aim:Set(key,value)
+        if not app.alive then return false end
+        value=validate(key,value)
+        if value==nil then return false end
         settings[key]=value;self.target=nil
         if bridge then
             bridge.gate.Value=false
@@ -1297,6 +1472,7 @@ local function createSilentAim(app,win,overlay,helpers)
         if key=="noRecoil" or key=="noSpread" then self:Enable(self.enabled) end
         local control=self.controls and self.controls[key]
         if control then control:Set(value,false) end
+        if app.ConfigChanged then app:ConfigChanged() end
         return true
     end
     function aim:Snapshot()
@@ -1423,10 +1599,9 @@ if old and type(old.Unload) == "function" then old:Unload() end
 local Library=loadSmugLibrary()
 assert(type(Library)=="table" and type(Library.CreateWindow)=="function","Failed to load SmugLib V2.")
 local app = {alive = true, enabled = false, entries = {}, objects = {}, connections = {}, controls = {},
-    stats = {drawn = 0, tracked = 0, rigs = 0, rays = 0, ms = 0}, version = "2026-11-06.8", error = nil}
+    stats = {drawn = 0, tracked = 0, rigs = 0, rays = 0, ms = 0}, version = "2026-11-11.1", error = nil}
 env.SmugESP = app
 app.protection=createProtection()
-local CONFIG_FILE = "SmugESP_OperationOne_v1.json"
 local defaults = {
     elements = {"Box", "Name", "Health", "Distance", "Arrows", "Chams"},
     box = "Corners", showEnemies = true, showAllies = false, colorMode = "Relationship", names = "Display + @username",
@@ -1457,6 +1632,7 @@ local ranges = {
 local elementNames = {"Box", "Name", "Health", "Distance", "Skeleton", "Head", "Tracers", "Arrows", "Chams", "Radar", "Equipment", "Status"}
 local C = table.clone(defaults)
 C.elements = table.clone(defaults.elements)
+C.objectRules = {}
 -- Compatibility aliases for settings saved by the Czech UI.
 local legacyValues={
     ["Jméno"]="Name",
@@ -1562,16 +1738,6 @@ local function valid(key, value)
     elseif type(d) == "string" and type(value) == "string" then return value:sub(1, 160) end
     return nil
 end
-if type(readfile) == "function" then
-    local ok, data = pcall(function() return HttpService:JSONDecode(readfile(CONFIG_FILE)) end)
-    if ok and type(data) == "table" then
-        for key, value in pairs(data) do local v = valid(key, value); if v ~= nil then C[key] = v end end
-        if data.showEnemies==nil and data.filter then
-            local filter=normalizeLegacy(data.filter)
-            C.showEnemies=filter~="Allies";C.showAllies=filter~="Enemies"
-        end
-    end
-end
 local features, colors = {}, {}
 local function rebuild()
     table.clear(features)
@@ -1665,11 +1831,13 @@ function app:Set(key,value)
         if key=="elements" then control:SetSelected(v) else control:Set(v,false) end
     end
     for _,binding in ipairs(self.customControls or {}) do binding.control:Set(binding.get()) end
+    self:ConfigChanged()
     return true
 end
 function app:Enable(on)
     if not self.alive then return end
     self.enabled=on==true
+    self:ConfigChanged()
     if self.master then self.master:Set(self.enabled,false) end
     if not self.enabled then
         for _,e in pairs(self.entries) do hide(e);if e.highlight then e.highlight:Destroy();e.highlight=nil end end
@@ -1680,6 +1848,7 @@ function app:Enable(on)
 end
 function app:Unload()
     if not self.alive then return end
+    if self.config then self.config:Close() end
     self.alive=false;self.enabled=false
     if self.silentAim then self.silentAim:Unload() end
     if self.protection then self.protection:Unload() end
@@ -1695,10 +1864,49 @@ function app:Snapshot()
     local result=table.clone(self.stats)
     result.enabled=self.enabled;result.alive=self.alive;result.error=self.error;result.version=self.version
     if self.silentAim then result.silentAim=self.silentAim:Snapshot() end
+    if self.config then result.config={path=self.config.path,status=self.config.status,dirty=self.config.dirty} end
     return result
 end
 function app:GetSettings()
     return HttpService:JSONDecode(HttpService:JSONEncode(C))
+end
+function app:ConfigChanged()
+    if self.config then self.config:Changed() end
+end
+function app:GetConfig()
+    local bind=self.master and self.master:GetKey()
+    return {schema=2,game="OperationOne",version=self.version,esp=self:GetSettings(),enabled=self.enabled,
+        espKey=bind and bind.Name or "F4",
+        aim={enabled=self.silentAim.enabled,settings=table.clone(self.silentAim.settings)}}
+end
+function app:ApplyConfig(data)
+    local saved=type(data.esp)=="table" and data.esp or {}
+    for key,default in pairs(defaults) do
+        local value=valid(key,saved[key])
+        if value==nil then value=type(default)=="table" and table.clone(default) or default end
+        C[key]=value
+    end
+    if data.legacy and saved.showEnemies==nil and saved.filter then
+        local filter=normalizeLegacy(saved.filter)
+        C.showEnemies=filter~="Allies";C.showAllies=filter~="Enemies"
+    end
+    rebuild()
+    for key,control in pairs(self.controls) do control:Set(C[key],false) end
+    for name,control in pairs(self.elementControls) do control:Set(features[name]==true) end
+    for _,binding in ipairs(self.customControls) do binding.control:Set(binding.get()) end
+    self.objectESP:ApplySettings(C.objectRules,data.legacy)
+    local bind=Enum.KeyCode.F4
+    if type(data.espKey)=="string" then
+        local keyOK,key=pcall(function()return Enum.KeyCode[data.espKey]end)
+        if keyOK and key~=Enum.KeyCode.Unknown then bind=key
+        elseif table.find({"MouseButton1","MouseButton2","MouseButton3"},data.espKey) then
+            bind=Enum.UserInputType[data.espKey]
+        end
+    end
+    self.master:SetKey(bind)
+    self:Enable(data.enabled==true)
+    local aim=type(data.aim)=="table" and data.aim or {}
+    self.silentAim:ApplySettings(aim.settings,aim.enabled==true)
 end
 -- Exact root identity; never match anonymous Viewmodels by proximity or display name.
 local function rigMap()
@@ -2090,7 +2298,7 @@ local ok,err=xpcall(function()
         AccentLightColor=Color3.fromRGB(101,229,181),SectionHeaderColor=Color3.fromRGB(29,39,44),OnClose=function()app:Unload()end})
     app.window=win
     -- SmugLib reads persistence during construction even with autosave disabled.
-    -- Clear those bindings before adding controls; ESP owns its validated, non-active settings.
+    -- Clear those bindings before adding controls; the versioned config owns all settings.
     win:SetConfig({},false)
     win:GetGui().DisplayOrder=20
     local function toggle(section,key,title)
@@ -2147,6 +2355,14 @@ local ok,err=xpcall(function()
     toggle(performance,"objectDeclutter","Reduce object label overlap")
     toggle(performance,"adaptive","Adaptive performance")
     toggle(performance,"hud","Compact status HUD")
+    app.config=createConfigStore(app,HttpService,env,function()return app:GetConfig()end,
+        function(data)app:ApplyConfig(data)end)
+    local configSection=system:Section("CONFIGURATION")
+    configSection:Label("Changes save automatically. Saved features activate on the next run.")
+    app.config.label=configSection:Label(app.config.status)
+    configSection:Button("Save config",function()app.config:Save(true)end)
+    configSection:Button("Load saved config",function()app.config:Load()end)
+    configSection:Button("Reset config to defaults",function()app.config:Reset()end)
     for _,p in ipairs(Players:GetPlayers()) do if p~=LocalPlayer then newEntry(p) end end
     connect(Players.PlayerAdded,function(p)if app.alive and p~=LocalPlayer then newEntry(p) end end)
     connect(Players.PlayerRemoving,function(p)
@@ -2159,7 +2375,14 @@ local ok,err=xpcall(function()
             if app.silentAim then app.silentAim:StopAll() end
         end
     end)
+    local configClock,lastBind=0,app.master:GetKey()
     connect(RunService.RenderStepped,function(dt)
+        configClock+=dt
+        if configClock>=0.5 then
+            configClock=0
+            local bind=app.master:GetKey()
+            if bind~=lastBind then lastBind=bind;app:ConfigChanged() end
+        end
         if app.silentAim then
             local aimOk,aimError=pcall(app.silentAim.Update,app.silentAim,dt)
             if not aimOk then app.silentAim.error=tostring(aimError);app.silentAim:StopAll() end
@@ -2168,8 +2391,10 @@ local ok,err=xpcall(function()
         if not success then app.error=tostring(renderError);app:Enable(false);warn("[SmugESP] "..app.error) end
     end)
     app:Refresh()
-    app:Enable(false)
-    win:Notify("ESP ready · press F4 to enable",3)
+    app.config.ready=true
+    app.config:Load()
+    lastBind=app.master:GetKey()
+    win:Notify("ESP ready · "..app.config.status,4)
 end,debug.traceback)
 if not ok then app.error=tostring(err);app:Unload();error("[SmugESP] "..tostring(err)) end
 return app
